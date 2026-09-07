@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# China Carrier Firewall
-# Menu chặn China Telecom / China Unicom / China Mobile
-# Debian 12/13 - IPv4 - ipset + iptables
+# China Carrier Firewall - Dual Stack
+# Chặn China Telecom / China Unicom / China Mobile theo ASN prefix
+# Debian 12/13 - IPv4 + IPv6 - ipset + iptables/ip6tables
 #
 # Chế độ:
-#   cn-carrier-fw              -> menu tương tác
+#   cn-carrier-fw                -> menu tương tác
 #   cn-carrier-fw --apply-saved -> cập nhật prefix và áp dụng cấu hình đã lưu
 #   cn-carrier-fw --status      -> xem trạng thái
 #   cn-carrier-fw --remove      -> gỡ toàn bộ rule do script tạo
@@ -12,16 +12,20 @@
 set -Eeuo pipefail
 
 APP="cn-carrier-fw"
-VERSION="2.5-final"
+VERSION="3.0-dualstack"
 INSTALL_PATH="/usr/local/sbin/cn-carrier-fw"
+
 CONF_DIR="/etc/cn-carrier-fw"
 CONF_FILE="$CONF_DIR/config"
 IPSET_SAVE="$CONF_DIR/ipset.rules"
 CACHE_DIR="$CONF_DIR/cache"
 LOCK_FILE="$CONF_DIR/update.lock"
 
-SET_NAME="cncfw_block"
-SET_NEW="cncfw_block_new"
+SET4="cncfw_block4"
+SET4_NEW="cncfw_block4_new"
+SET6="cncfw_block6"
+SET6_NEW="cncfw_block6_new"
+
 CHAIN_IN="CNCFW_INPUT"
 CHAIN_OUT="CNCFW_OUTPUT"
 CHAIN_FWD="CNCFW_FORWARD"
@@ -30,10 +34,12 @@ RESTORE_SERVICE="cn-carrier-fw-restore.service"
 UPDATE_SERVICE="cn-carrier-fw-update.service"
 UPDATE_TIMER="cn-carrier-fw-update.timer"
 
+PREFIX4_FILE="$CONF_DIR/prefixes4.new"
+PREFIX6_FILE="$CONF_DIR/prefixes6.new"
+
 # ----------------------------------------------------------------------
-# ASN chính và ASN mạng tỉnh/thành thường gặp.
-# Script tự cập nhật PREFIX đang được từng ASN công bố từ RIPEstat.
-# Nếu sau này nhà mạng có ASN mới, chỉ cần bổ sung ASN vào nhóm tương ứng.
+# ASN carrier.
+# Prefix IPv4 + IPv6 của các ASN này được lấy lại từ RIPEstat mỗi lần update.
 # ----------------------------------------------------------------------
 
 TELECOM_ASNS=(
@@ -59,16 +65,9 @@ UNICOM_ASNS=(
 )
 
 MOBILE_ASNS=(
-  9808    # China Mobile backbone
-  56040
-  56041
-  56042
-  56044
-  56046
-  56047
-  56048
-  24400   # Shanghai Mobile
-  24444   # Shandong Mobile
+  9808
+  56040 56041 56042 56044 56046 56047 56048
+  24400 24444
 )
 
 log()  { printf '\033[1;32m%s\033[0m\n' "$*"; }
@@ -85,19 +84,21 @@ need_root() {
 install_packages() {
   export DEBIAN_FRONTEND=noninteractive
   local missing=0
-  for c in curl jq ipset iptables flock; do
+
+  for c in curl jq ipset iptables ip6tables flock netfilter-persistent; do
     command -v "$c" >/dev/null 2>&1 || missing=1
   done
 
   if [[ "$missing" -eq 1 ]] || ! dpkg -s iptables-persistent >/dev/null 2>&1; then
     log "[+] Cài gói cần thiết..."
     apt-get update -qq
-    apt-get install -y -qq curl jq ipset iptables iptables-persistent util-linux >/dev/null
+    apt-get install -y -qq \
+      curl jq ipset iptables iptables-persistent util-linux >/dev/null
   fi
 }
 
 install_self() {
-  mkdir -p "$CONF_DIR"
+  mkdir -p "$CONF_DIR" "$CACHE_DIR"
   if [[ "$(readlink -f "$0")" != "$INSTALL_PATH" ]]; then
     cp -f "$0" "$INSTALL_PATH"
     chmod 700 "$INSTALL_PATH"
@@ -106,7 +107,6 @@ install_self() {
 
 save_choice() {
   local choice="$1"
-  mkdir -p "$CONF_DIR"
   cat >"$CONF_FILE" <<EOF
 CHOICE="$choice"
 EOF
@@ -118,12 +118,17 @@ load_choice() {
     err "Chưa có cấu hình đã lưu. Hãy chạy: $INSTALL_PATH"
     exit 1
   fi
+
   # shellcheck disable=SC1090
   source "$CONF_FILE"
-  if [[ -z "${CHOICE:-}" ]]; then
-    err "File cấu hình không hợp lệ."
-    exit 1
-  fi
+
+  case "${CHOICE:-}" in
+    1|2|3|4|5|6) ;;
+    *)
+      err "File cấu hình không hợp lệ."
+      exit 1
+      ;;
+  esac
 }
 
 choice_description() {
@@ -141,6 +146,7 @@ choice_description() {
 build_asn_list() {
   local choice="$1"
   SELECTED_ASNS=()
+
   case "$choice" in
     1) SELECTED_ASNS=("${TELECOM_ASNS[@]}") ;;
     2) SELECTED_ASNS=("${UNICOM_ASNS[@]}") ;;
@@ -157,186 +163,248 @@ build_asn_list() {
 
 fetch_prefixes() {
   local choice="$1"
-  local tmpdir outfile jsonfile asn failed=0 reused=0
-  local cache_file cache_ok tmp_prefix
+  local tmpdir jsonfile asn
+  local cache4 cache6 cacheok tmp4 tmp6
+  local failed=0 reused=0
+
   tmpdir="$(mktemp -d)"
-  outfile="$tmpdir/prefixes.txt"
-  : >"$outfile"
+  trap 'rm -rf "$tmpdir"' RETURN
+
+  : >"$tmpdir/all4"
+  : >"$tmpdir/all6"
 
   mkdir -p "$CACHE_DIR"
   build_asn_list "$choice"
 
-  log "[+] Cập nhật IPv4 prefix từ RIPEstat..."
+  log "[+] Cập nhật IPv4 + IPv6 prefix từ RIPEstat..."
+
   for asn in "${SELECTED_ASNS[@]}"; do
     printf '    AS%s ... ' "$asn"
 
     jsonfile="$tmpdir/as${asn}.json"
-    tmp_prefix="$tmpdir/as${asn}.prefixes"
-    cache_file="$CACHE_DIR/as${asn}.prefixes"
-    cache_ok="$CACHE_DIR/as${asn}.ok"
+    tmp4="$tmpdir/as${asn}.v4"
+    tmp6="$tmpdir/as${asn}.v6"
+    cache4="$CACHE_DIR/as${asn}.v4"
+    cache6="$CACHE_DIR/as${asn}.v6"
+    cacheok="$CACHE_DIR/as${asn}.ok"
 
-    if curl --connect-timeout 8 --max-time 30 --retry 2 --retry-delay 2 -fsSL \
+    if curl --connect-timeout 8 --max-time 30 \
+      --retry 2 --retry-delay 2 -fsSL \
       "https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS${asn}" \
       -o "$jsonfile" \
       && jq -e '.status == "ok" and (.data.prefixes | type == "array")' \
         "$jsonfile" >/dev/null 2>&1; then
 
-      jq -r '.data.prefixes[]?.prefix' "$jsonfile" | grep -Fv ':' >"$tmp_prefix" || true
+      jq -r '.data.prefixes[]?.prefix' "$jsonfile" | grep -Fv ':' >"$tmp4" || true
+      jq -r '.data.prefixes[]?.prefix' "$jsonfile" | grep -F ':'  >"$tmp6" || true
 
-      # Cập nhật cache kể cả khi ASN hợp lệ nhưng hiện không announce IPv4.
-      cp -f "$tmp_prefix" "$cache_file"
-      : >"$cache_ok"
+      cp -f "$tmp4" "$cache4"
+      cp -f "$tmp6" "$cache6"
+      : >"$cacheok"
 
-      cat "$tmp_prefix" >>"$outfile"
+      cat "$tmp4" >>"$tmpdir/all4"
+      cat "$tmp6" >>"$tmpdir/all6"
       echo "OK"
       continue
     fi
 
-    # Nếu API lỗi tạm thời, ưu tiên cache của lần thành công trước.
-    if [[ -f "$cache_ok" && -f "$cache_file" ]]; then
-      cat "$cache_file" >>"$outfile"
+    if [[ -f "$cacheok" && -f "$cache4" && -f "$cache6" ]]; then
+      cat "$cache4" >>"$tmpdir/all4"
+      cat "$cache6" >>"$tmpdir/all6"
       reused=$((reused + 1))
       echo "CACHE"
       continue
     fi
 
-    # Lần cài đầu mà ASN này chưa từng lấy được dữ liệu.
     failed=$((failed + 1))
     echo "LỖI"
   done
 
-  sort -u "$outfile" -o "$outfile"
-  PREFIX_COUNT="$(grep -c . "$outfile" || true)"
+  sort -u "$tmpdir/all4" -o "$tmpdir/all4"
+  sort -u "$tmpdir/all6" -o "$tmpdir/all6"
 
-  # Nếu chưa từng có cache mà một số ASN lỗi, không thay firewall bằng danh sách
-  # thiếu. Các lần sau, cache giúp update vẫn an toàn khi RIPEstat lỗi tạm thời.
+  PREFIX4_COUNT="$(grep -c . "$tmpdir/all4" || true)"
+  PREFIX6_COUNT="$(grep -c . "$tmpdir/all6" || true)"
+
   if (( failed > 0 )); then
-    rm -rf "$tmpdir"
-    err "Có $failed ASN chưa lấy được dữ liệu và chưa có cache. Giữ nguyên firewall/IPSet cũ."
-    exit 1
+    err "Có $failed ASN chưa lấy được dữ liệu và chưa có cache."
+    err "Giữ nguyên firewall/IPSet cũ."
+    return 1
   fi
 
-  if (( PREFIX_COUNT < 100 )); then
-    rm -rf "$tmpdir"
-    err "Chỉ lấy được $PREFIX_COUNT prefix. Giữ nguyên firewall cũ để tránh chặn sai."
-    exit 1
+  if (( PREFIX4_COUNT < 100 )); then
+    err "IPv4 chỉ lấy được $PREFIX4_COUNT prefix. Không cập nhật firewall."
+    return 1
   fi
 
-  PREFIX_FILE="$CONF_DIR/prefixes.new"
-  cp -f "$outfile" "$PREFIX_FILE"
-  rm -rf "$tmpdir"
+  if (( PREFIX6_COUNT < 1 )); then
+    err "Không lấy được prefix IPv6. Không cập nhật để tránh báo chặn dual-stack giả."
+    return 1
+  fi
+
+  cp -f "$tmpdir/all4" "$PREFIX4_FILE"
+  cp -f "$tmpdir/all6" "$PREFIX6_FILE"
 
   if (( reused > 0 )); then
     warn "[!] Có $reused ASN dùng cache do RIPEstat/network lỗi tạm thời."
   fi
-  log "[+] Tổng prefix IPv4: $PREFIX_COUNT"
+
+  log "[+] Tổng prefix IPv4: $PREFIX4_COUNT"
+  log "[+] Tổng prefix IPv6: $PREFIX6_COUNT"
 }
 
-update_ipset_atomic() {
-  ipset destroy "$SET_NEW" 2>/dev/null || true
-  ipset create "$SET_NEW" hash:net family inet hashsize 131072 maxelem 1000000
+update_ipsets_atomic() {
+  # Tạo set tạm hoàn chỉnh trước. Firewall cũ vẫn hoạt động trong lúc nạp.
+  ipset destroy "$SET4_NEW" 2>/dev/null || true
+  ipset destroy "$SET6_NEW" 2>/dev/null || true
 
-  # ipset restore nhanh hơn gọi ipset add từng dòng.
+  ipset create "$SET4_NEW" hash:net family inet  hashsize 131072 maxelem 1000000
+  ipset create "$SET6_NEW" hash:net family inet6 hashsize 32768  maxelem 1000000
+
   {
     while IFS= read -r net; do
-      [[ -n "$net" ]] && printf 'add %s %s -exist\n' "$SET_NEW" "$net"
-    done <"$PREFIX_FILE"
+      [[ -n "$net" ]] && printf 'add %s %s -exist\n' "$SET4_NEW" "$net"
+    done <"$PREFIX4_FILE"
   } | ipset restore
 
-  ipset create "$SET_NAME" hash:net family inet hashsize 131072 maxelem 1000000 -exist
-  ipset swap "$SET_NEW" "$SET_NAME"
-  ipset destroy "$SET_NEW"
+  {
+    while IFS= read -r net; do
+      [[ -n "$net" ]] && printf 'add %s %s -exist\n' "$SET6_NEW" "$net"
+    done <"$PREFIX6_FILE"
+  } | ipset restore
 
-  rm -f "$PREFIX_FILE"
+  ipset create "$SET4" hash:net family inet  hashsize 131072 maxelem 1000000 -exist
+  ipset create "$SET6" hash:net family inet6 hashsize 32768  maxelem 1000000 -exist
+
+  ipset swap "$SET4_NEW" "$SET4"
+  ipset swap "$SET6_NEW" "$SET6"
+
+  ipset destroy "$SET4_NEW"
+  ipset destroy "$SET6_NEW"
+
+  rm -f "$PREFIX4_FILE" "$PREFIX6_FILE"
 }
 
 ensure_jump_once() {
-  local parent="$1" child="$2"
-  while iptables -C "$parent" -j "$child" >/dev/null 2>&1; do
-    iptables -D "$parent" -j "$child"
+  local fw="$1" parent="$2" child="$3"
+
+  while "$fw" -C "$parent" -j "$child" >/dev/null 2>&1; do
+    "$fw" -D "$parent" -j "$child"
   done
-  iptables -I "$parent" 1 -j "$child"
+
+  "$fw" -I "$parent" 1 -j "$child"
 }
 
-apply_iptables() {
-  iptables -N "$CHAIN_IN" 2>/dev/null || true
-  iptables -F "$CHAIN_IN"
-  iptables -A "$CHAIN_IN" -m set --match-set "$SET_NAME" src -j DROP
+apply_family_rules() {
+  local fw="$1" setname="$2"
 
-  iptables -N "$CHAIN_OUT" 2>/dev/null || true
-  iptables -F "$CHAIN_OUT"
-  iptables -A "$CHAIN_OUT" -m set --match-set "$SET_NAME" dst -j DROP
+  "$fw" -N "$CHAIN_IN" 2>/dev/null || true
+  "$fw" -F "$CHAIN_IN"
+  "$fw" -A "$CHAIN_IN" -m set --match-set "$setname" src -j DROP
 
-  # Traffic được route/NAT xuyên qua VPS không đi qua INPUT/OUTPUT.
-  # Chặn cả hai chiều trên FORWARD để tránh bypass khi VPS làm relay/router.
-  iptables -N "$CHAIN_FWD" 2>/dev/null || true
-  iptables -F "$CHAIN_FWD"
-  iptables -A "$CHAIN_FWD" -m set --match-set "$SET_NAME" src -j DROP
-  iptables -A "$CHAIN_FWD" -m set --match-set "$SET_NAME" dst -j DROP
+  "$fw" -N "$CHAIN_OUT" 2>/dev/null || true
+  "$fw" -F "$CHAIN_OUT"
+  "$fw" -A "$CHAIN_OUT" -m set --match-set "$setname" dst -j DROP
 
-  ensure_jump_once INPUT "$CHAIN_IN"
-  ensure_jump_once OUTPUT "$CHAIN_OUT"
-  ensure_jump_once FORWARD "$CHAIN_FWD"
+  "$fw" -N "$CHAIN_FWD" 2>/dev/null || true
+  "$fw" -F "$CHAIN_FWD"
+  "$fw" -A "$CHAIN_FWD" -m set --match-set "$setname" src -j DROP
+  "$fw" -A "$CHAIN_FWD" -m set --match-set "$setname" dst -j DROP
 
-  # Dọn các chain cũ của bản thử trước đây nếu có.
+  ensure_jump_once "$fw" INPUT   "$CHAIN_IN"
+  ensure_jump_once "$fw" OUTPUT  "$CHAIN_OUT"
+  ensure_jump_once "$fw" FORWARD "$CHAIN_FWD"
+}
+
+cleanup_legacy_ipv4() {
+  # Các chain đời cũ trước CNCFW_*.
   while iptables -C INPUT -j CN_CARRIER_BLOCK >/dev/null 2>&1; do
     iptables -D INPUT -j CN_CARRIER_BLOCK || true
   done
   while iptables -C OUTPUT -j CN_CARRIER_BLOCK_OUT >/dev/null 2>&1; do
     iptables -D OUTPUT -j CN_CARRIER_BLOCK_OUT || true
   done
+
   iptables -F CN_CARRIER_BLOCK 2>/dev/null || true
   iptables -X CN_CARRIER_BLOCK 2>/dev/null || true
   iptables -F CN_CARRIER_BLOCK_OUT 2>/dev/null || true
   iptables -X CN_CARRIER_BLOCK_OUT 2>/dev/null || true
 }
 
+apply_firewall() {
+  apply_family_rules iptables  "$SET4"
+  apply_family_rules ip6tables "$SET6"
+
+  cleanup_legacy_ipv4
+
+  # Set IPv4 tên cũ của V2.x không còn được chain nào tham chiếu sau khi
+  # CNCFW_* đã được flush và tạo lại.
+  ipset destroy cncfw_block 2>/dev/null || true
+  ipset destroy cn_ut_block 2>/dev/null || true
+}
+
+verify_family() {
+  local fw="$1" setname="$2" label="$3"
+
+  ipset list "$setname" >/dev/null 2>&1 || {
+    err "Thiếu IPSet $label: $setname"
+    return 1
+  }
+
+  "$fw" -C INPUT -j "$CHAIN_IN" >/dev/null 2>&1 || {
+    err "$label thiếu jump INPUT -> $CHAIN_IN"
+    return 1
+  }
+  "$fw" -C OUTPUT -j "$CHAIN_OUT" >/dev/null 2>&1 || {
+    err "$label thiếu jump OUTPUT -> $CHAIN_OUT"
+    return 1
+  }
+  "$fw" -C FORWARD -j "$CHAIN_FWD" >/dev/null 2>&1 || {
+    err "$label thiếu jump FORWARD -> $CHAIN_FWD"
+    return 1
+  }
+
+  "$fw" -C "$CHAIN_IN" -m set --match-set "$setname" src -j DROP >/dev/null 2>&1 || {
+    err "$label thiếu DROP nguồn trong $CHAIN_IN"
+    return 1
+  }
+  "$fw" -C "$CHAIN_OUT" -m set --match-set "$setname" dst -j DROP >/dev/null 2>&1 || {
+    err "$label thiếu DROP đích trong $CHAIN_OUT"
+    return 1
+  }
+  "$fw" -C "$CHAIN_FWD" -m set --match-set "$setname" src -j DROP >/dev/null 2>&1 || {
+    err "$label thiếu DROP nguồn trong $CHAIN_FWD"
+    return 1
+  }
+  "$fw" -C "$CHAIN_FWD" -m set --match-set "$setname" dst -j DROP >/dev/null 2>&1 || {
+    err "$label thiếu DROP đích trong $CHAIN_FWD"
+    return 1
+  }
+}
 
 verify_firewall() {
-  # Xác nhận IPSet và toàn bộ jump/rule quan trọng thực sự tồn tại.
-  ipset list "$SET_NAME" >/dev/null 2>&1 || {
-    err "IPSet $SET_NAME không tồn tại sau khi áp dụng."
-    return 1
-  }
+  verify_family iptables  "$SET4" "IPv4"
+  verify_family ip6tables "$SET6" "IPv6"
+}
 
-  iptables -C INPUT -j "$CHAIN_IN" >/dev/null 2>&1 || {
-    err "Thiếu jump INPUT -> $CHAIN_IN."
-    return 1
-  }
-  iptables -C OUTPUT -j "$CHAIN_OUT" >/dev/null 2>&1 || {
-    err "Thiếu jump OUTPUT -> $CHAIN_OUT."
-    return 1
-  }
-  iptables -C FORWARD -j "$CHAIN_FWD" >/dev/null 2>&1 || {
-    err "Thiếu jump FORWARD -> $CHAIN_FWD."
-    return 1
-  }
+save_ipsets() {
+  : >"$IPSET_SAVE"
+  ipset save "$SET4" >>"$IPSET_SAVE"
+  ipset save "$SET6" >>"$IPSET_SAVE"
 
-  iptables -C "$CHAIN_IN" -m set --match-set "$SET_NAME" src -j DROP >/dev/null 2>&1 || {
-    err "Thiếu rule DROP nguồn trong $CHAIN_IN."
-    return 1
-  }
-  iptables -C "$CHAIN_OUT" -m set --match-set "$SET_NAME" dst -j DROP >/dev/null 2>&1 || {
-    err "Thiếu rule DROP đích trong $CHAIN_OUT."
-    return 1
-  }
-  iptables -C "$CHAIN_FWD" -m set --match-set "$SET_NAME" src -j DROP >/dev/null 2>&1 || {
-    err "Thiếu rule DROP nguồn trong $CHAIN_FWD."
-    return 1
-  }
-  iptables -C "$CHAIN_FWD" -m set --match-set "$SET_NAME" dst -j DROP >/dev/null 2>&1 || {
-    err "Thiếu rule DROP đích trong $CHAIN_FWD."
+  [[ -s "$IPSET_SAVE" ]] || {
+    err "Không lưu được IPSet persistent."
     return 1
   }
 }
 
 save_persistence() {
   mkdir -p "$CONF_DIR"
-  ipset save "$SET_NAME" >"$IPSET_SAVE"
+  save_ipsets
 
   cat >"/etc/systemd/system/$RESTORE_SERVICE" <<EOF
 [Unit]
-Description=Restore China Carrier Firewall ipset
+Description=Restore China Carrier Firewall IPv4/IPv6 ipsets
 DefaultDependencies=no
 After=local-fs.target
 Before=netfilter-persistent.service
@@ -351,6 +419,7 @@ WantedBy=multi-user.target
 EOF
 
   mkdir -p /etc/systemd/system/netfilter-persistent.service.d
+
   cat >/etc/systemd/system/netfilter-persistent.service.d/cn-carrier-fw.conf <<EOF
 [Unit]
 Requires=$RESTORE_SERVICE
@@ -359,7 +428,7 @@ EOF
 
   cat >"/etc/systemd/system/$UPDATE_SERVICE" <<EOF
 [Unit]
-Description=Update China Carrier Firewall prefixes
+Description=Update China Carrier Firewall IPv4/IPv6 prefixes
 After=network-online.target
 Wants=network-online.target
 
@@ -387,66 +456,80 @@ EOF
   systemctl enable "$RESTORE_SERVICE" >/dev/null
   systemctl enable "$UPDATE_TIMER" >/dev/null
   systemctl is-active --quiet "$UPDATE_TIMER" || systemctl start "$UPDATE_TIMER"
+
+  # iptables-persistent lưu cả /etc/iptables/rules.v4 và rules.v6.
   netfilter-persistent save >/dev/null
 
-  [[ -s "$IPSET_SAVE" ]] || {
-    err "Không lưu được IPSet persistent."
+  [[ -s /etc/iptables/rules.v4 ]] || {
+    err "Không thấy /etc/iptables/rules.v4 sau khi save."
+    return 1
+  }
+
+  [[ -s /etc/iptables/rules.v6 ]] || {
+    err "Không thấy /etc/iptables/rules.v6 sau khi save."
     return 1
   }
 }
 
 apply_choice() {
   local choice="$1"
-  rm -f "$CONF_DIR/prefixes.new"
+
+  rm -f "$PREFIX4_FILE" "$PREFIX6_FILE"
+
   fetch_prefixes "$choice"
-  update_ipset_atomic
-  apply_iptables
+  update_ipsets_atomic
+  apply_firewall
   verify_firewall
   save_choice "$choice"
   save_persistence
 
   echo
-  log "=============================================="
-  log " HOÀN TẤT"
+  log "=================================================="
+  log " HOÀN TẤT - IPv4 + IPv6"
   log " $(choice_description "$choice")"
-  log " Prefix IPv4: $PREFIX_COUNT"
+  log " Prefix IPv4: $PREFIX4_COUNT"
+  log " Prefix IPv6: $PREFIX6_COUNT"
+  log " Protocol: ALL (TCP/UDP/ICMP/ICMPv6/khác)"
+  log " INPUT + OUTPUT + FORWARD: BLOCK"
   log " Tự cập nhật: mỗi 24 giờ"
-  log "=============================================="
+  log "=================================================="
+}
+
+remove_chain_family() {
+  local fw="$1"
+
+  while "$fw" -C INPUT -j "$CHAIN_IN" >/dev/null 2>&1; do
+    "$fw" -D INPUT -j "$CHAIN_IN" || true
+  done
+  while "$fw" -C OUTPUT -j "$CHAIN_OUT" >/dev/null 2>&1; do
+    "$fw" -D OUTPUT -j "$CHAIN_OUT" || true
+  done
+  while "$fw" -C FORWARD -j "$CHAIN_FWD" >/dev/null 2>&1; do
+    "$fw" -D FORWARD -j "$CHAIN_FWD" || true
+  done
+
+  "$fw" -F "$CHAIN_IN" 2>/dev/null || true
+  "$fw" -X "$CHAIN_IN" 2>/dev/null || true
+  "$fw" -F "$CHAIN_OUT" 2>/dev/null || true
+  "$fw" -X "$CHAIN_OUT" 2>/dev/null || true
+  "$fw" -F "$CHAIN_FWD" 2>/dev/null || true
+  "$fw" -X "$CHAIN_FWD" 2>/dev/null || true
 }
 
 remove_all() {
-  log "[+] Gỡ China Carrier Firewall..."
+  log "[+] Gỡ China Carrier Firewall IPv4 + IPv6..."
 
-  while iptables -C INPUT -j "$CHAIN_IN" >/dev/null 2>&1; do
-    iptables -D INPUT -j "$CHAIN_IN" || true
-  done
-  while iptables -C OUTPUT -j "$CHAIN_OUT" >/dev/null 2>&1; do
-    iptables -D OUTPUT -j "$CHAIN_OUT" || true
-  done
-  while iptables -C FORWARD -j "$CHAIN_FWD" >/dev/null 2>&1; do
-    iptables -D FORWARD -j "$CHAIN_FWD" || true
-  done
-  iptables -F "$CHAIN_IN" 2>/dev/null || true
-  iptables -X "$CHAIN_IN" 2>/dev/null || true
-  iptables -F "$CHAIN_OUT" 2>/dev/null || true
-  iptables -X "$CHAIN_OUT" 2>/dev/null || true
-  iptables -F "$CHAIN_FWD" 2>/dev/null || true
-  iptables -X "$CHAIN_FWD" 2>/dev/null || true
+  remove_chain_family iptables
+  remove_chain_family ip6tables
+  cleanup_legacy_ipv4
 
-  # Dọn bản cũ nếu từng cài.
-  while iptables -C INPUT -j CN_CARRIER_BLOCK >/dev/null 2>&1; do
-    iptables -D INPUT -j CN_CARRIER_BLOCK || true
-  done
-  while iptables -C OUTPUT -j CN_CARRIER_BLOCK_OUT >/dev/null 2>&1; do
-    iptables -D OUTPUT -j CN_CARRIER_BLOCK_OUT || true
-  done
-  iptables -F CN_CARRIER_BLOCK 2>/dev/null || true
-  iptables -X CN_CARRIER_BLOCK 2>/dev/null || true
-  iptables -F CN_CARRIER_BLOCK_OUT 2>/dev/null || true
-  iptables -X CN_CARRIER_BLOCK_OUT 2>/dev/null || true
+  ipset destroy "$SET4_NEW" 2>/dev/null || true
+  ipset destroy "$SET6_NEW" 2>/dev/null || true
+  ipset destroy "$SET4" 2>/dev/null || true
+  ipset destroy "$SET6" 2>/dev/null || true
 
-  ipset destroy "$SET_NEW" 2>/dev/null || true
-  ipset destroy "$SET_NAME" 2>/dev/null || true
+  # Tên set các phiên bản cũ.
+  ipset destroy cncfw_block 2>/dev/null || true
   ipset destroy cn_ut_block 2>/dev/null || true
 
   systemctl disable --now "$UPDATE_TIMER" >/dev/null 2>&1 || true
@@ -457,20 +540,46 @@ remove_all() {
     "/etc/systemd/system/$UPDATE_SERVICE" \
     "/etc/systemd/system/$UPDATE_TIMER" \
     "/etc/systemd/system/netfilter-persistent.service.d/cn-carrier-fw.conf" \
-    "$CONF_FILE" "$IPSET_SAVE" "$CONF_DIR/prefixes.new" "$LOCK_FILE"
+    "$CONF_FILE" "$IPSET_SAVE" \
+    "$PREFIX4_FILE" "$PREFIX6_FILE"
 
   rm -rf "$CACHE_DIR"
 
   systemctl daemon-reload
   netfilter-persistent save >/dev/null 2>&1 || true
 
-  log "[+] Đã gỡ toàn bộ rule do script tạo."
+  log "[+] Đã gỡ toàn bộ IPv4 + IPv6 rule do script tạo."
+}
+
+show_set_status() {
+  local setname="$1" label="$2"
+
+  echo "--- $label IPSet ---"
+  if ipset list "$setname" >/dev/null 2>&1; then
+    ipset list "$setname" | grep -E '^(Name:|Type:|Header:|Size in memory:|Number of entries:)'
+  else
+    echo "$setname: chưa tồn tại"
+  fi
+}
+
+show_family_rules() {
+  local fw="$1" label="$2"
+
+  echo
+  echo "--- $label INPUT ---"
+  "$fw" -L "$CHAIN_IN" -n -v 2>/dev/null || true
+  echo
+  echo "--- $label OUTPUT ---"
+  "$fw" -L "$CHAIN_OUT" -n -v 2>/dev/null || true
+  echo
+  echo "--- $label FORWARD ---"
+  "$fw" -L "$CHAIN_FWD" -n -v 2>/dev/null || true
 }
 
 show_status() {
-  echo "=============================================="
-  echo " CHINA CARRIER FIREWALL - IPv4 - TRẠNG THÁI ($VERSION)"
-  echo "=============================================="
+  echo "=================================================="
+  echo " CHINA CARRIER FIREWALL - DUAL STACK ($VERSION)"
+  echo "=================================================="
 
   if [[ -f "$CONF_FILE" ]]; then
     # shellcheck disable=SC1090
@@ -480,19 +589,16 @@ show_status() {
     echo "Cấu hình: chưa lưu"
   fi
 
-  if ipset list "$SET_NAME" >/dev/null 2>&1; then
-    ipset list "$SET_NAME" | grep -E '^(Name:|Number of entries:|Size in memory:)'
-  else
-    echo "IPSet: chưa tồn tại"
-  fi
+  echo
+  show_set_status "$SET4" "IPv4"
+  echo
+  show_set_status "$SET6" "IPv6"
+
+  show_family_rules iptables "IPv4"
+  show_family_rules ip6tables "IPv6"
 
   echo
-  iptables -L "$CHAIN_IN" -n -v 2>/dev/null || true
-  echo
-  iptables -L "$CHAIN_OUT" -n -v 2>/dev/null || true
-  echo
-  iptables -L "$CHAIN_FWD" -n -v 2>/dev/null || true
-  echo
+  echo "--- TIMER ---"
   systemctl list-timers "$UPDATE_TIMER" --no-pager 2>/dev/null || true
 }
 
@@ -501,7 +607,7 @@ menu() {
     clear 2>/dev/null || true
     cat <<'EOF'
 ==================================================
-        CHINA CARRIER FIREWALL
+      CHINA CARRIER FIREWALL - IPv4 + IPv6
 ==================================================
 
 Chọn NHÀ MẠNG MUỐN CHẶN:
@@ -520,8 +626,8 @@ Chọn NHÀ MẠNG MUỐN CHẶN:
      -> Chỉ để China Telecom
 
   7) Xem trạng thái
-  8) Cập nhật lại prefix ngay
-  9) Gỡ toàn bộ chặn
+  8) Cập nhật lại IPv4 + IPv6 prefix ngay
+  9) Gỡ toàn bộ chặn IPv4 + IPv6
 
   0) Thoát
 
@@ -534,15 +640,22 @@ EOF
       1|2|3|4|5|6)
         echo
         warn "Bạn chọn: $(choice_description "$choice")"
-        warn "LƯU Ý: nếu IP SSH hiện tại thuộc nhà mạng bị chặn, kết nối có thể bị ngắt."
+        warn "Sẽ chặn ALL protocol trên IPv4 + IPv6, INPUT + OUTPUT + FORWARD."
+        warn "Nếu IP SSH hiện tại thuộc nhà mạng bị chặn, SSH có thể bị ngắt."
         read -r -p "Tiếp tục? [y/N]: " confirm
-        [[ "$confirm" =~ ^[Yy]$ ]] && apply_choice "$choice"
+
+        if [[ "$confirm" =~ ^[Yy]$ ]]; then
+          apply_choice "$choice"
+        fi
+
         read -r -p "Nhấn Enter để quay lại menu..." _
         ;;
+
       7)
         show_status
         read -r -p "Nhấn Enter để quay lại menu..." _
         ;;
+
       8)
         if [[ -f "$CONF_FILE" ]]; then
           load_choice
@@ -552,15 +665,18 @@ EOF
         fi
         read -r -p "Nhấn Enter để quay lại menu..." _
         ;;
+
       9)
-        warn "Thao tác này sẽ gỡ toàn bộ chặn China Carrier Firewall."
+        warn "Thao tác này sẽ gỡ toàn bộ IPv4 + IPv6 firewall do script tạo."
         read -r -p "Gõ YES để xác nhận: " confirm
         [[ "$confirm" == "YES" ]] && remove_all
         read -r -p "Nhấn Enter để quay lại menu..." _
         ;;
+
       0)
         exit 0
         ;;
+
       *)
         warn "Lựa chọn không hợp lệ."
         sleep 1
@@ -571,15 +687,10 @@ EOF
 
 main() {
   need_root
+  mkdir -p "$CONF_DIR" "$CACHE_DIR"
 
-  # Tạo sẵn thư mục cấu hình/cache/lock ngay từ lần chạy đầu tiên.
-  mkdir -p "$CONF_DIR"
-
-  # Cài util-linux trước khi gọi flock. Một số image Debian tối giản
-  # có thể chưa có flock ở lần chạy đầu tiên.
   install_packages
 
-  # Tránh timer và thao tác tay cập nhật cùng lúc.
   exec 9>"$LOCK_FILE"
   if ! flock -n 9; then
     err "Một tiến trình $APP khác đang chạy. Hãy thử lại sau."
@@ -593,24 +704,29 @@ main() {
       load_choice
       apply_choice "$CHOICE"
       ;;
+
     --status)
       show_status
       ;;
+
     --remove)
       remove_all
       ;;
+
     --help|-h)
       cat <<EOF
-$APP
+$APP $VERSION
   Không tham số      Mở menu
-  --apply-saved      Cập nhật prefix và áp dụng cấu hình đã lưu
-  --status           Xem trạng thái
-  --remove           Gỡ toàn bộ rule
+  --apply-saved      Cập nhật IPv4 + IPv6 và áp dụng cấu hình đã lưu
+  --status           Xem trạng thái IPv4 + IPv6
+  --remove           Gỡ toàn bộ IPv4 + IPv6 rule
 EOF
       ;;
+
     "")
       menu
       ;;
+
     *)
       err "Tham số không hợp lệ: $1"
       exit 1

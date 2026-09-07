@@ -12,7 +12,7 @@
 set -Eeuo pipefail
 
 APP="cn-carrier-fw"
-VERSION="3.0-dualstack"
+VERSION="3.1.1-selfupdate"
 INSTALL_PATH="/usr/local/sbin/cn-carrier-fw"
 
 CONF_DIR="/etc/cn-carrier-fw"
@@ -20,6 +20,17 @@ CONF_FILE="$CONF_DIR/config"
 IPSET_SAVE="$CONF_DIR/ipset.rules"
 CACHE_DIR="$CONF_DIR/cache"
 LOCK_FILE="$CONF_DIR/update.lock"
+
+# Nguồn self-update. Nếu repo public, script dùng RAW_URL trực tiếp.
+# Nếu repo private, có thể đặt token vào:
+#   /etc/cn-carrier-fw/github_token
+# hoặc export GITHUB_TOKEN trước khi chạy menu update.
+GITHUB_OWNER="Luanhoangkaki"
+GITHUB_REPO="NA88"
+GITHUB_BRANCH="main"
+GITHUB_FILE="cn-carrier-fw.sh"
+RAW_URL="https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/${GITHUB_BRANCH}/${GITHUB_FILE}"
+GITHUB_TOKEN_FILE="$CONF_DIR/github_token"
 
 SET4="cncfw_block4"
 SET4_NEW="cncfw_block4_new"
@@ -168,7 +179,6 @@ fetch_prefixes() {
   local failed=0 reused=0
 
   tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' RETURN
 
   : >"$tmpdir/all4"
   : >"$tmpdir/all6"
@@ -229,21 +239,25 @@ fetch_prefixes() {
   if (( failed > 0 )); then
     err "Có $failed ASN chưa lấy được dữ liệu và chưa có cache."
     err "Giữ nguyên firewall/IPSet cũ."
+    rm -rf "$tmpdir"
     return 1
   fi
 
   if (( PREFIX4_COUNT < 100 )); then
     err "IPv4 chỉ lấy được $PREFIX4_COUNT prefix. Không cập nhật firewall."
+    rm -rf "$tmpdir"
     return 1
   fi
 
   if (( PREFIX6_COUNT < 1 )); then
     err "Không lấy được prefix IPv6. Không cập nhật để tránh báo chặn dual-stack giả."
+    rm -rf "$tmpdir"
     return 1
   fi
 
   cp -f "$tmpdir/all4" "$PREFIX4_FILE"
   cp -f "$tmpdir/all6" "$PREFIX6_FILE"
+  rm -rf "$tmpdir"
 
   if (( reused > 0 )); then
     warn "[!] Có $reused ASN dùng cache do RIPEstat/network lỗi tạm thời."
@@ -516,6 +530,122 @@ remove_chain_family() {
   "$fw" -X "$CHAIN_FWD" 2>/dev/null || true
 }
 
+
+download_latest_script() {
+  local dest="$1"
+  local token="${GITHUB_TOKEN:-}"
+
+  if [[ -z "$token" && -s "$GITHUB_TOKEN_FILE" ]]; then
+    token="$(tr -d '\r\n' < "$GITHUB_TOKEN_FILE")"
+  fi
+
+  if [[ -n "$token" ]]; then
+    curl --connect-timeout 10 --max-time 60 --retry 2 --retry-delay 2 -fsSL \
+      -H "Authorization: Bearer $token" \
+      -H "Accept: application/vnd.github.raw+json" \
+      "https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${GITHUB_FILE}?ref=${GITHUB_BRANCH}" \
+      -o "$dest"
+  else
+    curl --connect-timeout 10 --max-time 60 --retry 2 --retry-delay 2 -fsSL \
+      "$RAW_URL" -o "$dest"
+  fi
+}
+
+extract_version_from_file() {
+  local file="$1"
+  sed -n 's/^VERSION="\([^"]*\)".*/\1/p' "$file" | head -n1
+}
+
+self_update() {
+  local tmp backup newver oldver
+  tmp="$(mktemp)"
+  backup="${INSTALL_PATH}.backup"
+  oldver="$VERSION"
+
+  log "[+] Kiểm tra bản cập nhật mới..."
+
+  if ! download_latest_script "$tmp"; then
+    rm -f "$tmp"
+    err "Không tải được file cập nhật."
+    if [[ ! -s "$GITHUB_TOKEN_FILE" && -z "${GITHUB_TOKEN:-}" ]]; then
+      warn "Nếu repo GitHub là PRIVATE, hãy lưu token vào:"
+      warn "  $GITHUB_TOKEN_FILE"
+    fi
+    return 1
+  fi
+
+  if [[ ! -s "$tmp" ]]; then
+    rm -f "$tmp"
+    err "File tải về rỗng."
+    return 1
+  fi
+
+  if ! head -n1 "$tmp" | grep -q '^#!/usr/bin/env bash'; then
+    rm -f "$tmp"
+    err "File tải về không giống script cn-carrier-fw."
+    return 1
+  fi
+
+  if ! grep -q '^APP="cn-carrier-fw"' "$tmp"; then
+    rm -f "$tmp"
+    err "Không tìm thấy marker APP trong bản tải về."
+    return 1
+  fi
+
+  if ! bash -n "$tmp"; then
+    rm -f "$tmp"
+    err "Bản mới có lỗi cú pháp Bash. Không cập nhật."
+    return 1
+  fi
+
+  newver="$(extract_version_from_file "$tmp")"
+  [[ -n "$newver" ]] || newver="không rõ"
+
+  echo
+  echo "Bản hiện tại : $oldver"
+  echo "Bản trên Git : $newver"
+  echo
+
+  if cmp -s "$tmp" "$INSTALL_PATH"; then
+    rm -f "$tmp"
+    log "[+] Bạn đang dùng đúng file mới nhất. Không cần cập nhật."
+    return 0
+  fi
+
+  cp -f "$INSTALL_PATH" "$backup"
+  chmod 700 "$backup"
+
+  cp -f "$tmp" "$INSTALL_PATH"
+  chmod 700 "$INSTALL_PATH"
+  rm -f "$tmp"
+
+  if ! bash -n "$INSTALL_PATH"; then
+    err "Bản mới lỗi sau khi cài. Đang rollback..."
+    cp -f "$backup" "$INSTALL_PATH"
+    chmod 700 "$INSTALL_PATH"
+    return 1
+  fi
+
+  log "[+] Đã thay code: $oldver -> $newver"
+  log "[+] Đang áp dụng lại cấu hình đã lưu bằng bản mới..."
+
+  # Chạy bản mới trong process mới. Nếu apply thất bại, rollback code cũ.
+  if CNCFW_PARENT_LOCK_HELD=1 "$INSTALL_PATH" --apply-saved; then
+    rm -f "$backup"
+    log "[+] SELF-UPDATE HOÀN TẤT."
+    return 0
+  fi
+
+  err "Bản mới chạy --apply-saved thất bại. Đang rollback code cũ..."
+  cp -f "$backup" "$INSTALL_PATH"
+  chmod 700 "$INSTALL_PATH"
+  rm -f "$backup"
+
+  # Cố gắng áp dụng lại cấu hình bằng bản cũ.
+  CNCFW_PARENT_LOCK_HELD=1 "$INSTALL_PATH" --apply-saved || true
+  return 1
+}
+
 remove_all() {
   log "[+] Gỡ China Carrier Firewall IPv4 + IPv6..."
 
@@ -627,14 +757,15 @@ Chọn NHÀ MẠNG MUỐN CHẶN:
 
   7) Xem trạng thái
   8) Cập nhật lại IPv4 + IPv6 prefix ngay
-  9) Gỡ toàn bộ chặn IPv4 + IPv6
+  9) Cập nhật chương trình từ GitHub
+ 10) Gỡ toàn bộ chặn IPv4 + IPv6
 
   0) Thoát
 
 ==================================================
 EOF
 
-    read -r -p "Nhập lựa chọn [0-9]: " choice
+    read -r -p "Nhập lựa chọn [0-10]: " choice
 
     case "$choice" in
       1|2|3|4|5|6)
@@ -667,6 +798,11 @@ EOF
         ;;
 
       9)
+        self_update || true
+        read -r -p "Nhấn Enter để quay lại menu..." _
+        ;;
+
+      10)
         warn "Thao tác này sẽ gỡ toàn bộ IPv4 + IPv6 firewall do script tạo."
         read -r -p "Gõ YES để xác nhận: " confirm
         [[ "$confirm" == "YES" ]] && remove_all
@@ -691,10 +827,15 @@ main() {
 
   install_packages
 
-  exec 9>"$LOCK_FILE"
-  if ! flock -n 9; then
-    err "Một tiến trình $APP khác đang chạy. Hãy thử lại sau."
-    exit 1
+  # Bình thường mỗi process phải giữ lock riêng để tránh timer/menu chạy đồng thời.
+  # Riêng child --apply-saved do self_update gọi sẽ kế thừa parent đang giữ lock,
+  # nên không được cố flock lần hai.
+  if [[ "${CNCFW_PARENT_LOCK_HELD:-0}" != "1" ]]; then
+    exec 9>"$LOCK_FILE"
+    if ! flock -n 9; then
+      err "Một tiến trình $APP khác đang chạy. Hãy thử lại sau."
+      exit 1
+    fi
   fi
 
   install_self
@@ -720,6 +861,7 @@ $APP $VERSION
   --apply-saved      Cập nhật IPv4 + IPv6 và áp dụng cấu hình đã lưu
   --status           Xem trạng thái IPv4 + IPv6
   --remove           Gỡ toàn bộ IPv4 + IPv6 rule
+  Menu 9             Self-update code từ GitHub
 EOF
       ;;
 

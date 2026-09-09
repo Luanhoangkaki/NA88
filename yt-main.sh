@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="6.3.0"
+VERSION="6.8.0"
 
 YT_REPO_OWNER="${YT_REPO_OWNER:-Luanhoangkaki}"
 YT_REPO_NAME="${YT_REPO_NAME:-NA88}"
@@ -99,11 +99,53 @@ persist_local_ip(){
   mv -f "$tmp" "$STATE_FILE"
 }
 
+
+apt_retry(){
+  local max_wait=600 waited=0 rc out
+  while true; do
+    out="$("$@" 2>&1)" && { printf '%s\n' "$out"; return 0; }
+    rc=$?
+
+    if grep -Eqi 'Could not get lock|Unable to acquire the dpkg frontend lock|is another process using it|Could not open lock file|frontend lock was locked by another process|locked by another process|Resource temporarily unavailable' <<<"$out"; then
+      (( waited == 0 )) && warn "APT đang bận. Đang chờ tự động..."
+      (( waited < max_wait )) || {
+        printf '%s\n' "$out" >&2
+        die "APT vẫn bị khóa sau ${max_wait}s."
+      }
+      sleep 5
+      waited=$((waited+5))
+      continue
+    fi
+
+    printf '%s\n' "$out" >&2
+    return "$rc"
+  done
+}
+
 install_deps(){
-  command -v apt-get >/dev/null 2>&1 || die "Chỉ hỗ trợ Debian/Ubuntu."
+  command -v apt-get >/dev/null 2>&1 || die "Chỉ hỗ trợ Debian/Ubuntu dùng apt."
+
+  local need=0 cmd
+  for cmd in curl ip wg wg-quick iptables python3 gzip ping sha256sum; do
+    command -v "$cmd" >/dev/null 2>&1 || need=1
+  done
+  [[ "$need" -eq 0 ]] && return 0
+
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq
-  apt-get install -y -qq wireguard-tools iproute2 curl gzip python3 >/dev/null
+
+  # Không phụ thuộc fuser/pgrep: chính apt-get được retry nếu lock đang bận.
+  apt_retry dpkg --configure -a || die "dpkg --configure -a thất bại."
+  apt_retry apt-get update || die "apt-get update thất bại."
+  apt_retry apt-get install -y \
+    wireguard-tools iptables iproute2 curl ca-certificates \
+    python3 gzip iputils-ping coreutils procps psmisc \
+    || die "Không cài được dependency MAIN."
+
+  for cmd in curl ip wg wg-quick iptables python3 gzip ping sha256sum; do
+    command -v "$cmd" >/dev/null 2>&1 || die "Thiếu dependency MAIN sau khi cài: $cmd"
+  done
+
+  ok "Dependency MAIN đã sẵn sàng."
 }
 
 check_v2node(){
@@ -426,7 +468,17 @@ cmd_activate(){
     die "Default route thay đổi sau restart V2Node. Đã rollback."
   }
 
-  systemctl enable "wg-quick@${WG_IF}" yt-main-route.service "$V2NODE_SERVICE" >/dev/null
+  if ! systemctl enable "wg-quick@${WG_IF}" yt-main-route.service "$V2NODE_SERVICE" >/dev/null; then
+    restore_binary || true
+    rm -f "$DROPIN_FILE"
+    systemctl daemon-reload
+    systemctl restart "$V2NODE_SERVICE" >/dev/null 2>&1 || true
+    cleanup_runtime
+    die "Không enable được autostart MAIN. Đã rollback."
+  fi
+
+  persist_local_ip "$LOCAL_TUNNEL_IP"
+
   ok "YT MAIN đã ACTIVE."
   cmd_test
 }
@@ -600,6 +652,7 @@ cmd_update_core(){
   need_root
   load_state || die "Chưa prepare yt-main."
   check_v2node
+  install_deps
   local gz="/tmp/v2node-youtube-final.gz.$$"
   local shaf="/tmp/v2node-youtube-final.gz.sha256.$$"
   local newbin="/tmp/v2node-youtube-final.$$"

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="6.3.0"
+VERSION="6.8.0"
 OWNER="${YT_REPO_OWNER:-Luanhoangkaki}"
 REPO="${YT_REPO_NAME:-NA88}"
 REF="${YT_REPO_REF:-main}"
@@ -26,20 +26,38 @@ need_root(){
   [[ ${EUID:-$(id -u)} -eq 0 ]] || die "Hãy chạy bằng root."
 }
 
+
+apt_retry(){
+  local max_wait=600 waited=0 rc out
+  while true; do
+    out="$("$@" 2>&1)" && { printf '%s\n' "$out"; return 0; }
+    rc=$?
+
+    if grep -Eqi 'Could not get lock|Unable to acquire the dpkg frontend lock|is another process using it|Could not open lock file|frontend lock was locked by another process|locked by another process|Resource temporarily unavailable' <<<"$out"; then
+      (( waited == 0 )) && warn "APT đang bận. Đang chờ tự động..."
+      (( waited < max_wait )) || {
+        printf '%s\n' "$out" >&2
+        die "APT vẫn bị khóa sau ${max_wait}s."
+      }
+      sleep 5
+      waited=$((waited+5))
+      continue
+    fi
+
+    printf '%s\n' "$out" >&2
+    return "$rc"
+  done
+}
+
 install_deps(){
-  local missing=0
-  command -v curl >/dev/null 2>&1 || missing=1
-  command -v bash >/dev/null 2>&1 || missing=1
+  command -v curl >/dev/null 2>&1 && command -v bash >/dev/null 2>&1 && return 0
+  command -v apt-get >/dev/null 2>&1 || die "YT Manager chỉ hỗ trợ Debian/Ubuntu dùng apt."
 
-  [[ "$missing" -eq 0 ]] && return 0
-
-  if command -v apt-get >/dev/null 2>&1; then
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq
-    apt-get install -y -qq curl ca-certificates bash >/dev/null
-  else
-    die "YT Manager hiện hỗ trợ Debian/Ubuntu."
-  fi
+  export DEBIAN_FRONTEND=noninteractive
+  apt_retry dpkg --configure -a || die "dpkg --configure -a thất bại."
+  apt_retry apt-get update || die "apt-get update thất bại."
+  apt_retry apt-get install -y curl ca-certificates bash procps psmisc \
+    || die "Không cài được dependency YT Manager."
 }
 
 load_token(){

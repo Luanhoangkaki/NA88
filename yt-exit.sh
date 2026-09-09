@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="6.3.0"
+VERSION="6.8.0"
 
 YT_REPO_OWNER="${YT_REPO_OWNER:-Luanhoangkaki}"
 YT_REPO_NAME="${YT_REPO_NAME:-NA88}"
@@ -85,11 +85,51 @@ detect_out_if(){ ip -4 route show default | awk 'NR==1 {for(i=1;i<=NF;i++) if($i
 default_route(){ ip -4 route show default | head -1; }
 public_ip(){ curl -4fsS --max-time 6 https://api.ipify.org 2>/dev/null || curl -4fsS --max-time 6 https://ifconfig.me 2>/dev/null || true; }
 
+
+apt_retry(){
+  local max_wait=600 waited=0 rc out
+  while true; do
+    out="$("$@" 2>&1)" && { printf '%s\n' "$out"; return 0; }
+    rc=$?
+
+    if grep -Eqi 'Could not get lock|Unable to acquire the dpkg frontend lock|is another process using it|Could not open lock file|frontend lock was locked by another process|locked by another process|Resource temporarily unavailable' <<<"$out"; then
+      (( waited == 0 )) && warn "APT đang bận. Đang chờ tự động..."
+      (( waited < max_wait )) || {
+        printf '%s\n' "$out" >&2
+        die "APT vẫn bị khóa sau ${max_wait}s."
+      }
+      sleep 5
+      waited=$((waited+5))
+      continue
+    fi
+
+    printf '%s\n' "$out" >&2
+    return "$rc"
+  done
+}
+
 install_deps(){
-  command -v apt-get >/dev/null 2>&1 || die "Chỉ hỗ trợ Debian/Ubuntu."
+  command -v apt-get >/dev/null 2>&1 || die "Chỉ hỗ trợ Debian/Ubuntu dùng apt."
+
+  local need=0 cmd
+  for cmd in curl ip wg wg-quick iptables systemctl ss; do
+    command -v "$cmd" >/dev/null 2>&1 || need=1
+  done
+  [[ "$need" -eq 0 ]] && return 0
+
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq
-  apt-get install -y -qq wireguard-tools iptables iproute2 curl >/dev/null
+
+  apt_retry dpkg --configure -a || die "dpkg --configure -a thất bại."
+  apt_retry apt-get update || die "apt-get update thất bại."
+  apt_retry apt-get install -y \
+    wireguard-tools iptables iproute2 curl ca-certificates procps psmisc \
+    || die "Không cài được dependency EXIT."
+
+  for cmd in curl ip wg wg-quick iptables systemctl ss; do
+    command -v "$cmd" >/dev/null 2>&1 || die "Thiếu dependency EXIT sau khi cài: $cmd"
+  done
+
+  ok "Dependency EXIT đã sẵn sàng."
 }
 
 check_exit_subnet_collision(){
@@ -392,10 +432,20 @@ cmd_uninstall(){
   need_root; load_state || true
   warn "Đang gỡ yt-exit..."
   systemctl disable --now "wg-quick@${WG_IF}" >/dev/null 2>&1 || true
+
+  # Fallback cleanup nếu service chết trước khi PostDown chạy.
+  if command -v iptables >/dev/null 2>&1 && [[ -n "${OUT_IF:-}" && -n "${EXIT_TUN_IP:-}" && -n "${PREFIX:-}" ]]; then
+    while iptables -D FORWARD -i "$WG_IF" -o "$OUT_IF" -j ACCEPT 2>/dev/null; do :; done
+    while iptables -D FORWARD -i "$OUT_IF" -o "$WG_IF" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; do :; done
+    while iptables -t nat -D POSTROUTING -s "${EXIT_TUN_IP%.*}.0/${PREFIX}" -o "$OUT_IF" -j MASQUERADE 2>/dev/null; do :; done
+  fi
+
   rm -f "$WG_CONF" "$SYSCTL_FILE"
+
   if [[ -n "${IP_FORWARD_BEFORE:-}" ]]; then
     sysctl -w "net.ipv4.ip_forward=${IP_FORWARD_BEFORE}" >/dev/null 2>&1 || true
   fi
+
   rm -rf "$STATE_DIR"
   ok "Đã gỡ yt-exit và khôi phục ip_forward trước khi cài."
 }

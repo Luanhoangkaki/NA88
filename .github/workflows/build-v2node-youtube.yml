@@ -1,0 +1,234 @@
+name: Build V2Node YouTube Core
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "Upstream v2node tag/branch/commit"
+        required: true
+        default: "v0.4.5"
+      release_tag:
+        description: "Release tag (leave empty for automatic)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout NA88
+        uses: actions/checkout@v4
+
+      - name: Checkout upstream v2node
+        uses: actions/checkout@v4
+        with:
+          repository: wyx2685/v2node
+          ref: ${{ inputs.source_ref }}
+          path: v2node-src
+          fetch-depth: 1
+
+      - name: Setup Go 1.26.1
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.26.1"
+          cache-dependency-path: v2node-src/go.sum
+
+      - name: Show source revision
+        shell: bash
+        run: |
+          set -e
+          cd v2node-src
+          go version
+          git log -1 --oneline
+
+      - name: Patch YouTube opt-in routing
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd v2node-src
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          outbound = Path("core/outbound.go")
+          custom = Path("core/custom.go")
+
+          s = outbound.read_text()
+
+          old_import = 'import (\n\t"fmt"\n\n\t"encoding/json"\n'
+          new_import = 'import (\n\t"fmt"\n\t"os"\n\n\t"encoding/json"\n'
+
+          if old_import not in s:
+              raise SystemExit("ERROR: outbound.go import block changed; refusing unsafe patch")
+
+          s = s.replace(old_import, new_import, 1)
+
+          youtube_func = r'''
+
+          // buildYouTubeOutbound creates an optional YouTube-only outbound.
+          // If V2NODE_YOUTUBE_SOURCE is not configured, this feature stays disabled.
+          func buildYouTubeOutbound() (*core.OutboundHandlerConfig, error) {
+              sendThrough := os.Getenv("V2NODE_YOUTUBE_SOURCE")
+              if sendThrough == "" {
+                  return nil, nil
+              }
+
+              outboundDetourConfig := &conf.OutboundDetourConfig{}
+              outboundDetourConfig.Protocol = "freedom"
+              outboundDetourConfig.Tag = "youtube-exit"
+              outboundDetourConfig.SendThrough = &sendThrough
+
+              proxySetting := &conf.FreedomConfig{
+                  DomainStrategy: "UseIPv4",
+              }
+
+              var setting json.RawMessage
+              setting, err := json.Marshal(proxySetting)
+              if err != nil {
+                  return nil, fmt.Errorf("marshal youtube outbound config error: %s", err)
+              }
+
+              outboundDetourConfig.Settings = &setting
+              return outboundDetourConfig.Build()
+          }
+          '''
+
+          s += youtube_func
+          outbound.write_text(s)
+
+          s = custom.read_text()
+
+          old = '''\tdns, _ := buildDnsOutbound()
+          \tcoreOutboundConfig = append(coreOutboundConfig, dns)
+
+          \t//route
+          '''
+
+          new = '''\tdns, _ := buildDnsOutbound()
+          \tcoreOutboundConfig = append(coreOutboundConfig, dns)
+
+          \t// Optional YouTube-only outbound.
+          \t// If V2NODE_YOUTUBE_SOURCE is not set, v2node behaves like upstream.
+          \tyoutubeEnabled := false
+          \tyoutubeOutbound, err := buildYouTubeOutbound()
+          \tif err != nil {
+          \t\treturn nil, nil, nil, err
+          \t}
+          \tif youtubeOutbound != nil {
+          \t\tcoreOutboundConfig = append(coreOutboundConfig, youtubeOutbound)
+          \t\tyoutubeEnabled = true
+          \t}
+
+          \t//route
+          '''
+
+          if old not in s:
+              raise SystemExit("ERROR: custom.go outbound insertion point changed; refusing unsafe patch")
+
+          s = s.replace(old, new, 1)
+
+          old2 = '''\tcoreRouterConfig := &coreConf.RouterConfig{
+          \t\tRuleList:       []json.RawMessage{dnsRule},
+          \t\tDomainStrategy: &domainStrategy,
+          \t}
+          '''
+
+          new2 = '''\tcoreRouterConfig := &coreConf.RouterConfig{
+          \t\tRuleList:       []json.RawMessage{dnsRule},
+          \t\tDomainStrategy: &domainStrategy,
+          \t}
+
+          \tif youtubeEnabled {
+          \t\tyoutubeRule, _ := json.Marshal(map[string]interface{}{
+          \t\t\t"domain": []string{
+          \t\t\t\t"domain:youtube.com",
+          \t\t\t\t"domain:youtu.be",
+          \t\t\t\t"domain:googlevideo.com",
+          \t\t\t\t"domain:ytimg.com",
+          \t\t\t\t"domain:youtubei.googleapis.com",
+          \t\t\t},
+          \t\t\t"outboundTag": "youtube-exit",
+          \t\t})
+          \t\tcoreRouterConfig.RuleList = append(coreRouterConfig.RuleList, youtubeRule)
+          \t}
+          '''
+
+          if old2 not in s:
+              raise SystemExit("ERROR: custom.go RouterConfig changed; refusing unsafe patch")
+
+          s = s.replace(old2, new2, 1)
+          custom.write_text(s)
+          PY
+
+          gofmt -w core/outbound.go core/custom.go
+          git diff --check
+          git --no-pager diff --stat
+
+      - name: Build V2Node YouTube Core
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd v2node-src
+          mkdir -p ../release-assets
+
+          GOEXPERIMENT=jsonv2 go build -v \
+            -o ../release-assets/v2node-youtube-final \
+            -trimpath \
+            -ldflags "-s -w -buildid=" \
+            .
+
+          chmod 755 ../release-assets/v2node-youtube-final
+          ../release-assets/v2node-youtube-final version
+          ls -lh ../release-assets/v2node-youtube-final
+
+      - name: Compress and checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+
+          gzip -9 -c v2node-youtube-final > v2node-youtube-final.gz
+          sha256sum v2node-youtube-final.gz > v2node-youtube-final.gz.sha256
+          sha256sum v2node-youtube-final > v2node-youtube-final.sha256
+
+          ls -lh
+          cat v2node-youtube-final.gz.sha256
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: v2node-youtube-core
+          path: |
+            release-assets/v2node-youtube-final.gz
+            release-assets/v2node-youtube-final.gz.sha256
+            release-assets/v2node-youtube-final.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.release_tag }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "$INPUT_TAG" ]]; then
+            TAG="$INPUT_TAG"
+          else
+            TAG="yt-core-${SOURCE_REF//\//-}-run-${GITHUB_RUN_NUMBER}"
+          fi
+
+          gh release create "$TAG" \
+            release-assets/v2node-youtube-final.gz \
+            release-assets/v2node-youtube-final.gz.sha256 \
+            release-assets/v2node-youtube-final.sha256 \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "YT Core $TAG" \
+            --notes "Automated V2Node YouTube Core build from upstream ref: $SOURCE_REF" \
+            --latest

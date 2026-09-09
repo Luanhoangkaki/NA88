@@ -1,7 +1,52 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="4.1.0"
+VERSION="6.1.0"
+
+YT_REPO_OWNER="${YT_REPO_OWNER:-Luanhoangkaki}"
+YT_REPO_NAME="${YT_REPO_NAME:-NA88}"
+YT_REPO_REF="${YT_REPO_REF:-main}"
+YT_GH_ENV="/etc/yt-manager/github.env"
+
+load_gh_token(){
+  if [[ -z "${GH_TOKEN:-}" && -f "$YT_GH_ENV" ]]; then
+    source "$YT_GH_ENV"
+  fi
+}
+
+need_gh_token(){
+  load_gh_token
+  [[ -n "${GH_TOKEN:-}" ]] || die "Chưa có GitHub token. Chạy lệnh yt rồi vào mục GitHub token."
+}
+
+gh_raw_download(){
+  local path="$1" out="$2"
+  need_gh_token
+  curl -4fsSL --retry 3 --connect-timeout 10     -H "Authorization: Bearer $GH_TOKEN"     -H "Accept: application/vnd.github.raw+json"     "https://api.github.com/repos/${YT_REPO_OWNER}/${YT_REPO_NAME}/contents/${path}?ref=${YT_REPO_REF}"     -o "$out"
+}
+
+gh_release_asset_download(){
+  local asset_name="$1" out="$2"
+  need_gh_token
+  local meta="/tmp/yt-release.$$.json" asset_id
+  curl -4fsSL --retry 3 --connect-timeout 10     -H "Authorization: Bearer $GH_TOKEN"     -H "Accept: application/vnd.github+json"     "https://api.github.com/repos/${YT_REPO_OWNER}/${YT_REPO_NAME}/releases/latest"     -o "$meta" || { rm -f "$meta"; die "Không đọc được GitHub Release latest."; }
+
+  asset_id="$(python3 - "$meta" "$asset_name" <<'PY'
+import json,sys
+data=json.load(open(sys.argv[1]))
+name=sys.argv[2]
+for a in data.get("assets",[]):
+    if a.get("name")==name:
+        print(a.get("id",""))
+        break
+PY
+)"
+  rm -f "$meta"
+  [[ -n "$asset_id" ]] || die "Không thấy Release asset: $asset_name"
+
+  curl -4fL --retry 3 --connect-timeout 10     -H "Authorization: Bearer $GH_TOKEN"     -H "Accept: application/octet-stream"     "https://api.github.com/repos/${YT_REPO_OWNER}/${YT_REPO_NAME}/releases/assets/${asset_id}"     -o "$out" || die "Không tải được Release asset: $asset_name"
+}
+
 SELF_URL="https://raw.githubusercontent.com/Luanhoangkaki/NA88/main/yt-exit.sh"
 
 WG_IF="ytwg0"
@@ -284,13 +329,12 @@ cmd_version(){
 cmd_update(){
   need_root
   local tmp="/tmp/yt-exit.sh.$$"
-  info "Đang kiểm tra bản lệnh mới..."
-  curl -4fsSL --retry 3 --connect-timeout 10 "$SELF_URL" -o "$tmp" || die "Không tải được yt-exit.sh từ Git."
-  bash -n "$tmp" || { rm -f "$tmp"; die "File mới lỗi cú pháp, không cập nhật."; }
-  install -m 755 "$tmp" /usr/local/bin/yt-exit
+  info "Đang tải yt-exit mới từ Git private..."
+  gh_raw_download "yt-exit.sh" "$tmp"
+  bash -n "$tmp" || { rm -f "$tmp"; die "File mới lỗi cú pháp."; }
+  install -m 755 "$tmp" /usr/local/lib/yt-manager/yt-exit.sh
   rm -f "$tmp"
   ok "Đã cập nhật yt-exit."
-  /usr/local/bin/yt-exit version
 }
 
 menu(){

@@ -1,7 +1,52 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="4.1.0"
+VERSION="6.1.0"
+
+YT_REPO_OWNER="${YT_REPO_OWNER:-Luanhoangkaki}"
+YT_REPO_NAME="${YT_REPO_NAME:-NA88}"
+YT_REPO_REF="${YT_REPO_REF:-main}"
+YT_GH_ENV="/etc/yt-manager/github.env"
+
+load_gh_token(){
+  if [[ -z "${GH_TOKEN:-}" && -f "$YT_GH_ENV" ]]; then
+    source "$YT_GH_ENV"
+  fi
+}
+
+need_gh_token(){
+  load_gh_token
+  [[ -n "${GH_TOKEN:-}" ]] || die "Chưa có GitHub token. Chạy lệnh yt rồi vào mục GitHub token."
+}
+
+gh_raw_download(){
+  local path="$1" out="$2"
+  need_gh_token
+  curl -4fsSL --retry 3 --connect-timeout 10     -H "Authorization: Bearer $GH_TOKEN"     -H "Accept: application/vnd.github.raw+json"     "https://api.github.com/repos/${YT_REPO_OWNER}/${YT_REPO_NAME}/contents/${path}?ref=${YT_REPO_REF}"     -o "$out"
+}
+
+gh_release_asset_download(){
+  local asset_name="$1" out="$2"
+  need_gh_token
+  local meta="/tmp/yt-release.$$.json" asset_id
+  curl -4fsSL --retry 3 --connect-timeout 10     -H "Authorization: Bearer $GH_TOKEN"     -H "Accept: application/vnd.github+json"     "https://api.github.com/repos/${YT_REPO_OWNER}/${YT_REPO_NAME}/releases/latest"     -o "$meta" || { rm -f "$meta"; die "Không đọc được GitHub Release latest."; }
+
+  asset_id="$(python3 - "$meta" "$asset_name" <<'PY'
+import json,sys
+data=json.load(open(sys.argv[1]))
+name=sys.argv[2]
+for a in data.get("assets",[]):
+    if a.get("name")==name:
+        print(a.get("id",""))
+        break
+PY
+)"
+  rm -f "$meta"
+  [[ -n "$asset_id" ]] || die "Không thấy Release asset: $asset_name"
+
+  curl -4fL --retry 3 --connect-timeout 10     -H "Authorization: Bearer $GH_TOKEN"     -H "Accept: application/octet-stream"     "https://api.github.com/repos/${YT_REPO_OWNER}/${YT_REPO_NAME}/releases/assets/${asset_id}"     -o "$out" || die "Không tải được Release asset: $asset_name"
+}
+
 SELF_URL="https://raw.githubusercontent.com/Luanhoangkaki/NA88/main/yt-main.sh"
 
 WG_IF="ytwg0"
@@ -39,7 +84,7 @@ install_deps(){
   command -v apt-get >/dev/null 2>&1 || die "Chỉ hỗ trợ Debian/Ubuntu."
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
-  apt-get install -y -qq wireguard-tools iproute2 curl gzip >/dev/null
+  apt-get install -y -qq wireguard-tools iproute2 curl gzip python3 >/dev/null
 }
 
 check_v2node(){
@@ -49,28 +94,21 @@ check_v2node(){
 
 download_binary(){
   mkdir -p "$ASSET_DIR"
-  local src="${1:-}" url="${YT_BINARY_URL:-$DEFAULT_BINARY_URL}"
-  local sha_url="${YT_SHA_URL:-$DEFAULT_SHA_URL}"
+  local src="${1:-}"
 
   if [[ -n "$src" && -s "$src" ]]; then
     cp -a "$src" "$CUSTOM_BIN"
   elif [[ -s /root/v2node-youtube-final ]]; then
     cp -a /root/v2node-youtube-final "$CUSTOM_BIN"
   else
-    info "Tải binary custom từ GitHub Release..."
-    curl -4fL --retry 3 --connect-timeout 10 "$url" -o "$ASSET_DIR/v2node-youtube-final.gz" || \
-      die "Không tải được binary."
+    info "Tải YouTube Core từ GitHub Release private..."
+    gh_release_asset_download "v2node-youtube-final.gz" "$ASSET_DIR/v2node-youtube-final.gz"
+    gh_release_asset_download "v2node-youtube-final.gz.sha256" "$ASSET_DIR/v2node-youtube-final.gz.sha256"
 
-    if curl -4fsSL --retry 2 --connect-timeout 10 "$sha_url" -o "$ASSET_DIR/v2node-youtube-final.gz.sha256"; then
-      local expected actual
-      expected="$(awk 'NR==1{print $1}' "$ASSET_DIR/v2node-youtube-final.gz.sha256")"
-      actual="$(sha256sum "$ASSET_DIR/v2node-youtube-final.gz" | awk '{print $1}')"
-      [[ "$expected" == "$actual" ]] || die "SHA256 binary tải về không khớp."
-      ok "SHA256 asset hợp lệ."
-    else
-      die "Thiếu file checksum Release: v2node-youtube-final.gz.sha256"
-    fi
-
+    local expected actual
+    expected="$(awk 'NR==1{print $1}' "$ASSET_DIR/v2node-youtube-final.gz.sha256")"
+    actual="$(sha256sum "$ASSET_DIR/v2node-youtube-final.gz" | awk '{print $1}')"
+    [[ -n "$expected" && "$expected" == "$actual" ]] || die "SHA256 Core không khớp."
     gzip -dc "$ASSET_DIR/v2node-youtube-final.gz" >"$CUSTOM_BIN"
   fi
 
@@ -297,13 +335,19 @@ cmd_activate(){
   make_route_files "$LOCAL_TUNNEL_IP"
 
   systemctl daemon-reload
-  systemctl start "wg-quick@${WG_IF}"
+  if ! systemctl start "wg-quick@${WG_IF}"; then
+    cleanup_runtime
+    die "Không khởi động được WireGuard. Đã dọn cấu hình runtime."
+  fi
   sleep 1
 
   after="$(default_route)"
   [[ "$after" == "$before" ]] || { cleanup_runtime; die "WireGuard làm thay default route. Đã rollback."; }
 
-  systemctl start yt-main-route.service
+  if ! systemctl start yt-main-route.service; then
+    cleanup_runtime
+    die "Không khởi động được policy route. Đã rollback."
+  fi
   sleep 1
 
   ip route get 8.8.8.8 from "$LOCAL_TUNNEL_IP" 2>/dev/null | grep -q "dev $WG_IF" || {
@@ -322,7 +366,14 @@ cmd_activate(){
   make_v2node_dropin "$LOCAL_TUNNEL_IP"
 
   systemctl daemon-reload
-  systemctl restart "$V2NODE_SERVICE"
+  if ! systemctl restart "$V2NODE_SERVICE"; then
+    restore_binary || true
+    rm -f "$DROPIN_FILE"
+    systemctl daemon-reload
+    systemctl restart "$V2NODE_SERVICE" >/dev/null 2>&1 || true
+    cleanup_runtime
+    die "Restart V2Node custom thất bại. Đã rollback."
+  fi
   sleep 4
 
   if ! systemctl is-active --quiet "$V2NODE_SERVICE"; then
@@ -441,8 +492,17 @@ cmd_repair(){
   make_v2node_dropin "$LOCAL_TUNNEL_IP"
   make_route_files "$LOCAL_TUNNEL_IP"
   systemctl daemon-reload
-  systemctl enable --now "wg-quick@${WG_IF}" yt-main-route.service >/dev/null
-  systemctl restart "$V2NODE_SERVICE"
+  if ! systemctl enable --now "wg-quick@${WG_IF}" yt-main-route.service >/dev/null; then
+    restore_binary || true
+    die "Không phục hồi được WireGuard/policy route."
+  fi
+
+  if ! systemctl restart "$V2NODE_SERVICE"; then
+    restore_binary || true
+    systemctl restart "$V2NODE_SERVICE" >/dev/null 2>&1 || true
+    die "Repair làm V2Node restart lỗi. Đã rollback binary."
+  fi
+
   sleep 3
   cmd_test
 }
@@ -494,30 +554,26 @@ cmd_version(){
 cmd_update(){
   need_root
   local tmp="/tmp/yt-main.sh.$$"
-  info "Đang kiểm tra bản lệnh mới..."
-  curl -4fsSL --retry 3 --connect-timeout 10 "$SELF_URL" -o "$tmp" || die "Không tải được yt-main.sh từ Git."
-  bash -n "$tmp" || { rm -f "$tmp"; die "File mới lỗi cú pháp, không cập nhật."; }
-  install -m 755 "$tmp" /usr/local/bin/yt-main
+  info "Đang tải yt-main mới từ Git private..."
+  gh_raw_download "yt-main.sh" "$tmp"
+  bash -n "$tmp" || { rm -f "$tmp"; die "File mới lỗi cú pháp."; }
+  install -m 755 "$tmp" /usr/local/lib/yt-manager/yt-main.sh
   rm -f "$tmp"
   ok "Đã cập nhật yt-main."
-  /usr/local/bin/yt-main version
 }
 
 cmd_update_core(){
   need_root
   load_state || die "Chưa prepare yt-main."
   check_v2node
-
-  local url="${YT_BINARY_URL:-$DEFAULT_BINARY_URL}"
-  local sha_url="${YT_SHA_URL:-$DEFAULT_SHA_URL}"
   local gz="/tmp/v2node-youtube-final.gz.$$"
   local shaf="/tmp/v2node-youtube-final.gz.sha256.$$"
   local newbin="/tmp/v2node-youtube-final.$$"
-  local backup expected actual
+  local backup expected actual before
 
-  info "Tải YouTube Core mới..."
-  curl -4fL --retry 3 --connect-timeout 10 "$url" -o "$gz" || die "Không tải được Core."
-  curl -4fsSL --retry 3 --connect-timeout 10 "$sha_url" -o "$shaf" || { rm -f "$gz"; die "Không tải được checksum Core."; }
+  info "Tải YouTube Core mới từ GitHub Release private..."
+  gh_release_asset_download "v2node-youtube-final.gz" "$gz"
+  gh_release_asset_download "v2node-youtube-final.gz.sha256" "$shaf"
 
   expected="$(awk 'NR==1{print $1}' "$shaf")"
   actual="$(sha256sum "$gz" | awk '{print $1}')"
@@ -528,32 +584,34 @@ cmd_update_core(){
   "$newbin" version >/dev/null 2>&1 || { rm -f "$gz" "$shaf" "$newbin"; die "Core mới không chạy được."; }
 
   backup="$(backup_binary)"
-  info "Backup V2Node hiện tại: $backup"
-
+  info "Backup V2Node: $backup"
   cp -a "$newbin" "$CUSTOM_BIN"
   chmod 755 "$CUSTOM_BIN"
   sha256sum "$CUSTOM_BIN" | awk '{print $1}' >"$ASSET_DIR/custom.sha256"
-
   cp -a "$CUSTOM_BIN" "$V2NODE_BIN"
   chmod 755 "$V2NODE_BIN"
 
-  systemctl restart "$V2NODE_SERVICE"
-  sleep 4
-
-  if ! systemctl is-active --quiet "$V2NODE_SERVICE"; then
+  before="$(default_route)"
+  if ! systemctl restart "$V2NODE_SERVICE"; then
     restore_binary || true
     systemctl restart "$V2NODE_SERVICE" >/dev/null 2>&1 || true
     rm -f "$gz" "$shaf" "$newbin"
-    die "Core mới làm V2Node lỗi. Đã rollback."
+    die "Core mới làm restart V2Node thất bại. Đã rollback."
+  fi
+  sleep 4
+
+  if ! systemctl is-active --quiet "$V2NODE_SERVICE" || [[ "$(default_route)" != "$before" ]]; then
+    restore_binary || true
+    systemctl restart "$V2NODE_SERVICE" >/dev/null 2>&1 || true
+    rm -f "$gz" "$shaf" "$newbin"
+    die "Core mới lỗi hoặc làm đổi default route. Đã rollback."
   fi
 
-  if [[ -n "${LOCAL_TUNNEL_IP:-}" ]]; then
-    if ! ip route get 8.8.8.8 from "$LOCAL_TUNNEL_IP" 2>/dev/null | grep -q "dev $WG_IF"; then
-      restore_binary || true
-      systemctl restart "$V2NODE_SERVICE" >/dev/null 2>&1 || true
-      rm -f "$gz" "$shaf" "$newbin"
-      die "Policy route không còn đúng sau update Core. Đã rollback."
-    fi
+  if [[ -n "${LOCAL_TUNNEL_IP:-}" ]] && ! ip route get 8.8.8.8 from "$LOCAL_TUNNEL_IP" 2>/dev/null | grep -q "dev $WG_IF"; then
+    restore_binary || true
+    systemctl restart "$V2NODE_SERVICE" >/dev/null 2>&1 || true
+    rm -f "$gz" "$shaf" "$newbin"
+    die "Policy route sai sau update Core. Đã rollback."
   fi
 
   rm -f "$gz" "$shaf" "$newbin"

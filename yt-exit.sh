@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="6.1.0"
+VERSION="6.3.0"
 
 YT_REPO_OWNER="${YT_REPO_OWNER:-Luanhoangkaki}"
 YT_REPO_NAME="${YT_REPO_NAME:-NA88}"
@@ -70,6 +70,17 @@ die(){ echo -e "${RED}[ERROR]${RESET} $*" >&2; exit 1; }
 
 need_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || die "Hãy chạy bằng root."; }
 load_state(){ [[ -f "$STATE_FILE" ]] || return 1; source "$STATE_FILE"; }
+
+valid_ipv4(){
+  local ip="$1" a b c d x
+  IFS=. read -r a b c d <<<"$ip"
+  for x in "$a" "$b" "$c" "$d"; do
+    [[ "$x" =~ ^[0-9]{1,3}$ ]] || return 1
+    (( 10#$x >= 0 && 10#$x <= 255 )) || return 1
+  done
+  [[ "$ip" == "$a.$b.$c.$d" ]]
+}
+
 detect_out_if(){ ip -4 route show default | awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'; }
 default_route(){ ip -4 route show default | head -1; }
 public_ip(){ curl -4fsS --max-time 6 https://api.ipify.org 2>/dev/null || curl -4fsS --max-time 6 https://ifconfig.me 2>/dev/null || true; }
@@ -139,10 +150,41 @@ EOF
 
 reload_wg(){
   if systemctl is-active --quiet "wg-quick@${WG_IF}"; then
-    wg syncconf "$WG_IF" <(wg-quick strip "$WG_IF")
+    local tmp rc
+    tmp="$(mktemp /tmp/yt-wg.XXXXXX)"
+    if ! wg-quick strip "$WG_IF" >"$tmp"; then
+      rm -f "$tmp"
+      return 1
+    fi
+    wg syncconf "$WG_IF" "$tmp"
+    rc=$?
+    rm -f "$tmp"
+    return "$rc"
   else
     systemctl start "wg-quick@${WG_IF}"
   fi
+}
+
+rollback_install(){
+  warn "Rollback cài EXIT..."
+
+  systemctl disable --now "wg-quick@${WG_IF}" >/dev/null 2>&1 || true
+
+  # Dọn rule fallback trong trường hợp service đã chết trước khi PostDown chạy.
+  if command -v iptables >/dev/null 2>&1 && [[ -n "${OUT_IF:-}" && -n "${EXIT_TUN_IP:-}" && -n "${PREFIX:-}" ]]; then
+    while iptables -D FORWARD -i "$WG_IF" -o "$OUT_IF" -j ACCEPT 2>/dev/null; do :; done
+    while iptables -D FORWARD -i "$OUT_IF" -o "$WG_IF" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; do :; done
+    while iptables -t nat -D POSTROUTING -s "${EXIT_TUN_IP%.*}.0/${PREFIX}" -o "$OUT_IF" -j MASQUERADE 2>/dev/null; do :; done
+  fi
+
+  rm -f "$WG_CONF" "$SYSCTL_FILE"
+
+  if [[ -n "${IP_FORWARD_BEFORE:-}" ]]; then
+    sysctl -w "net.ipv4.ip_forward=${IP_FORWARD_BEFORE}" >/dev/null 2>&1 || true
+  fi
+
+  rm -rf "$STATE_DIR"
+  ok "Đã rollback EXIT."
 }
 
 cmd_install(){
@@ -154,7 +196,7 @@ cmd_install(){
   DEFAULT_ROUTE_BEFORE="$(default_route)"
   PUBLIC_IP="$(public_ip)"
   IP_FORWARD_BEFORE="$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo 0)"
-  [[ "$PUBLIC_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || warn "Không tự xác định được Public IPv4; lệnh info sẽ hiện unknown."
+  valid_ipv4 "$PUBLIC_IP" || warn "Không tự xác định được Public IPv4; lệnh info sẽ hiện unknown."
 
   read -rp "WireGuard port [${DEFAULT_PORT}]: " WG_PORT
   WG_PORT="${WG_PORT:-$DEFAULT_PORT}"
@@ -164,7 +206,7 @@ cmd_install(){
   WG_MTU="${YT_WG_MTU:-$DEFAULT_MTU}"
 
   [[ "$WG_PORT" =~ ^[0-9]+$ ]] && (( WG_PORT >= 1 && WG_PORT <= 65535 )) || die "WireGuard port không hợp lệ."
-  [[ "$EXIT_TUN_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "EXIT tunnel IP không hợp lệ."
+  valid_ipv4 "$EXIT_TUN_IP" || die "EXIT tunnel IP không hợp lệ."
   [[ "$WG_MTU" =~ ^[0-9]+$ ]] && (( WG_MTU >= 1280 && WG_MTU <= 1500 )) || die "MTU không hợp lệ (1280-1500)."
 
   check_exit_subnet_collision
@@ -188,13 +230,28 @@ cmd_install(){
   echo 'net.ipv4.ip_forward=1' >"$SYSCTL_FILE"
   sysctl -p "$SYSCTL_FILE" >/dev/null
 
-  systemctl enable --now "wg-quick@${WG_IF}" >/dev/null
+  if ! systemctl enable --now "wg-quick@${WG_IF}" >/dev/null; then
+    rollback_install
+    die "Không khởi động được WireGuard EXIT."
+  fi
   sleep 1
 
-  [[ "$(default_route)" == "$DEFAULT_ROUTE_BEFORE" ]] || {
-    systemctl disable --now "wg-quick@${WG_IF}" >/dev/null 2>&1 || true
-    die "Default route bị thay đổi. Đã dừng WireGuard."
-  }
+  if [[ "$(default_route)" != "$DEFAULT_ROUTE_BEFORE" ]]; then
+    rollback_install
+    die "Default route bị thay đổi. Đã rollback toàn bộ cài EXIT."
+  fi
+
+  if ! systemctl is-active --quiet "wg-quick@${WG_IF}"; then
+    rollback_install
+    die "WireGuard EXIT không active. Đã rollback."
+  fi
+
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    if ! ufw status 2>/dev/null | grep -Eq "${WG_PORT}/udp.*ALLOW"; then
+      warn "UFW đang ACTIVE nhưng chưa thấy ALLOW ${WG_PORT}/udp."
+      warn "Nếu MAIN không handshake, hãy mở UDP ${WG_PORT} ở UFW và firewall nhà cung cấp."
+    fi
+  fi
 
   ok "VPS EXIT đã sẵn sàng."
   cmd_info
@@ -235,22 +292,30 @@ cmd_add(){
   [[ "$pubkey" =~ ^[A-Za-z0-9+/]{42,44}=$ ]] || die "Public Key không hợp lệ."
   [[ -n "$ip" ]] || ip="$(next_ip)"
   ip="${ip%/32}"
-  [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Tunnel IP MAIN không hợp lệ."
+  valid_ipv4 "$ip" || die "Tunnel IP MAIN không hợp lệ."
   [[ "${ip%.*}" == "${EXIT_TUN_IP%.*}" ]] || die "MAIN tunnel IP phải cùng subnet /24 với EXIT."
   [[ "$ip" != "$EXIT_TUN_IP" ]] || die "MAIN không được dùng cùng tunnel IP với EXIT."
 
   grep -R -Fq "$pubkey" "$PEER_DIR" 2>/dev/null && die "Public Key đã tồn tại."
   grep -R -Fq "AllowedIPs = ${ip}/32" "$PEER_DIR" 2>/dev/null && die "Tunnel IP đã được dùng."
 
-  cat >"$PEER_DIR/${name}.conf" <<EOF
+  local peer_file="$PEER_DIR/${name}.conf"
+  cat >"$peer_file" <<EOF
 # MAIN: $name
 [Peer]
 PublicKey = $pubkey
 AllowedIPs = ${ip}/32
 EOF
-  chmod 600 "$PEER_DIR/${name}.conf"
+  chmod 600 "$peer_file"
 
-  rebuild_conf; reload_wg
+  rebuild_conf
+  if ! reload_wg; then
+    rm -f "$peer_file"
+    rebuild_conf
+    reload_wg >/dev/null 2>&1 || true
+    die "Không reload được WireGuard. Đã rollback peer $name."
+  fi
+
   ok "Đã thêm $name."
   echo "MAIN_TUNNEL_IP=$ip"
   echo "Trên VPS MAIN chạy: yt-main activate $ip"
@@ -261,9 +326,23 @@ cmd_remove(){
   local name="${1:-}"
   [[ -n "$name" ]] || read -rp "Tên MAIN cần xóa: " name
   name="$(safe_name "$name")"
-  [[ -f "$PEER_DIR/${name}.conf" ]] || die "Không tìm thấy MAIN $name."
-  rm -f "$PEER_DIR/${name}.conf"
-  rebuild_conf; reload_wg
+  local peer_file="$PEER_DIR/${name}.conf"
+  [[ -f "$peer_file" ]] || die "Không tìm thấy MAIN $name."
+
+  local backup="/tmp/yt-peer-${name}.$$"
+  cp -a "$peer_file" "$backup"
+  rm -f "$peer_file"
+  rebuild_conf
+
+  if ! reload_wg; then
+    cp -a "$backup" "$peer_file"
+    rebuild_conf
+    reload_wg >/dev/null 2>&1 || true
+    rm -f "$backup"
+    die "Không reload được WireGuard. Đã khôi phục MAIN $name."
+  fi
+
+  rm -f "$backup"
   ok "Đã xóa $name."
 }
 

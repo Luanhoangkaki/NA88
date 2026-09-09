@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="6.1.0"
+VERSION="6.3.0"
 
 YT_REPO_OWNER="${YT_REPO_OWNER:-Luanhoangkaki}"
 YT_REPO_NAME="${YT_REPO_NAME:-NA88}"
@@ -79,6 +79,25 @@ need_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || die "Hãy chạy bằng root."; }
 default_route(){ ip -4 route show default | head -1; }
 detect_out_if(){ ip -4 route show default | awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'; }
 load_state(){ [[ -f "$STATE_FILE" ]] || return 1; source "$STATE_FILE"; }
+
+valid_ipv4(){
+  local ip="$1" a b c d x
+  IFS=. read -r a b c d <<<"$ip"
+  for x in "$a" "$b" "$c" "$d"; do
+    [[ "$x" =~ ^[0-9]{1,3}$ ]] || return 1
+    (( 10#$x >= 0 && 10#$x <= 255 )) || return 1
+  done
+  [[ "$ip" == "$a.$b.$c.$d" ]]
+}
+
+persist_local_ip(){
+  local ip="$1" tmp
+  tmp="$(mktemp "$STATE_DIR/state.XXXXXX")"
+  grep -v '^LOCAL_TUNNEL_IP=' "$STATE_FILE" >"$tmp" || true
+  printf "LOCAL_TUNNEL_IP='%s'\n" "$ip" >>"$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$STATE_FILE"
+}
 
 install_deps(){
   command -v apt-get >/dev/null 2>&1 || die "Chỉ hỗ trợ Debian/Ubuntu."
@@ -223,6 +242,13 @@ EOF
 
 backup_binary(){
   mkdir -p "$STATE_DIR/backups"
+
+  # Giữ bản V2Node trước khi YT MAIN chạm vào lần đầu tiên.
+  if [[ ! -f "$STATE_DIR/backups/original" ]]; then
+    cp -a "$V2NODE_BIN" "$STATE_DIR/backups/original"
+    chmod 755 "$STATE_DIR/backups/original"
+  fi
+
   local dst="$STATE_DIR/backups/v2node.$(date +%Y%m%d-%H%M%S)"
   cp -a "$V2NODE_BIN" "$dst"
   ln -sfn "$dst" "$STATE_DIR/backups/latest"
@@ -233,6 +259,13 @@ restore_binary(){
   local latest="$STATE_DIR/backups/latest"
   [[ -e "$latest" ]] || return 1
   cp -a "$(readlink -f "$latest")" "$V2NODE_BIN"
+  chmod 755 "$V2NODE_BIN"
+}
+
+restore_original_binary(){
+  local original="$STATE_DIR/backups/original"
+  [[ -f "$original" ]] || return 1
+  cp -a "$original" "$V2NODE_BIN"
   chmod 755 "$V2NODE_BIN"
 }
 
@@ -261,10 +294,10 @@ cmd_prepare(){
   read -rp "EXIT tunnel IP [10.88.0.1]: " EXIT_TUNNEL_IP
   EXIT_TUNNEL_IP="${EXIT_TUNNEL_IP:-10.88.0.1}"
 
-  [[ "$EXIT_PUBLIC_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "EXIT Public IP không hợp lệ."
+  valid_ipv4 "$EXIT_PUBLIC_IP" || die "EXIT Public IP không hợp lệ."
   [[ "$EXIT_PUBLIC_KEY" =~ ^[A-Za-z0-9+/]{42,44}=$ ]] || die "EXIT Public Key không hợp lệ."
   [[ "$EXIT_PORT" =~ ^[0-9]+$ ]] && (( EXIT_PORT >= 1 && EXIT_PORT <= 65535 )) || die "EXIT port không hợp lệ."
-  [[ "$EXIT_TUNNEL_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "EXIT tunnel IP không hợp lệ."
+  valid_ipv4 "$EXIT_TUNNEL_IP" || die "EXIT tunnel IP không hợp lệ."
 
   OUT_IF="$(detect_out_if)"
   DEFAULT_ROUTE_BEFORE="$(default_route)"
@@ -319,11 +352,10 @@ cmd_activate(){
   local local_ip="${1:-}"
   [[ -n "$local_ip" ]] || read -rp "MAIN tunnel IP do EXIT cấp: " local_ip
   local_ip="${local_ip%/32}"
-  [[ "$local_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "MAIN tunnel IP không hợp lệ."
+  valid_ipv4 "$local_ip" || die "MAIN tunnel IP không hợp lệ."
   [[ "$(tunnel_prefix "$local_ip")" == "$(tunnel_prefix "$EXIT_TUNNEL_IP")" ]] || die "MAIN và EXIT tunnel IP phải cùng subnet /24."
   check_tunnel_collision "$local_ip"
   LOCAL_TUNNEL_IP="$local_ip"
-  echo "LOCAL_TUNNEL_IP='$LOCAL_TUNNEL_IP'" >>"$STATE_FILE"
 
   local priv before after backup
   priv="$(cat "$STATE_DIR/private.key")"
@@ -512,8 +544,10 @@ cmd_rollback(){
   restore_binary || die "Không có backup binary."
   rm -f "$DROPIN_FILE"
   systemctl daemon-reload
-  systemctl restart "$V2NODE_SERVICE"
-  ok "Đã rollback V2Node gốc. Tunnel vẫn giữ nhưng route YouTube trong V2Node đã tắt."
+  if ! systemctl restart "$V2NODE_SERVICE"; then
+    die "Đã khôi phục binary nhưng restart V2Node thất bại. Hãy kiểm tra: systemctl status v2node"
+  fi
+  ok "Đã rollback V2Node. Tunnel vẫn giữ nhưng route YouTube trong V2Node đã tắt."
 }
 
 cmd_uninstall(){
@@ -531,12 +565,12 @@ cmd_uninstall(){
     current_sha="$(sha256sum "$V2NODE_BIN" | awk '{print $1}')"
     custom_sha="$(cat "$ASSET_DIR/custom.sha256")"
     if [[ "$current_sha" == "$custom_sha" ]]; then
-      restore_binary || true
+      restore_original_binary || restore_binary || true
     else
       warn "Giữ nguyên binary V2Node hiện tại vì nó không còn là custom binary (có thể đã update upstream)."
     fi
   else
-    restore_binary || true
+    restore_original_binary || restore_binary || true
   fi
   systemctl daemon-reload >/dev/null 2>&1 || true
   systemctl restart "$V2NODE_SERVICE" >/dev/null 2>&1 || true
@@ -585,10 +619,9 @@ cmd_update_core(){
 
   backup="$(backup_binary)"
   info "Backup V2Node: $backup"
-  cp -a "$newbin" "$CUSTOM_BIN"
-  chmod 755 "$CUSTOM_BIN"
-  sha256sum "$CUSTOM_BIN" | awk '{print $1}' >"$ASSET_DIR/custom.sha256"
-  cp -a "$CUSTOM_BIN" "$V2NODE_BIN"
+
+  # Thử Core mới trực tiếp trên V2Node trước. Chỉ cập nhật asset sau khi health-check PASS.
+  cp -a "$newbin" "$V2NODE_BIN"
   chmod 755 "$V2NODE_BIN"
 
   before="$(default_route)"
@@ -613,6 +646,10 @@ cmd_update_core(){
     rm -f "$gz" "$shaf" "$newbin"
     die "Policy route sai sau update Core. Đã rollback."
   fi
+
+  cp -a "$newbin" "$CUSTOM_BIN"
+  chmod 755 "$CUSTOM_BIN"
+  sha256sum "$CUSTOM_BIN" | awk '{print $1}' >"$ASSET_DIR/custom.sha256"
 
   rm -f "$gz" "$shaf" "$newbin"
   ok "Đã cập nhật YouTube Core."

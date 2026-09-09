@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="6.1.0"
+VERSION="6.3.0"
 OWNER="${YT_REPO_OWNER:-Luanhoangkaki}"
 REPO="${YT_REPO_NAME:-NA88}"
 REF="${YT_REPO_REF:-main}"
@@ -27,6 +27,12 @@ need_root(){
 }
 
 install_deps(){
+  local missing=0
+  command -v curl >/dev/null 2>&1 || missing=1
+  command -v bash >/dev/null 2>&1 || missing=1
+
+  [[ "$missing" -eq 0 ]] && return 0
+
   if command -v apt-get >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
@@ -132,12 +138,14 @@ update_role(){
   }
 
   install -m 755 "$tmp" "$BASE/yt-${role}.sh"
+  ln -sfn "$BASE/yt-${role}.sh" "/usr/local/bin/yt-${role}"
   rm -f "$tmp"
 }
 
 ensure_role(){
   local role="$1"
   [[ -x "$BASE/yt-${role}.sh" ]] || update_role "$role"
+  ln -sfn "$BASE/yt-${role}.sh" "/usr/local/bin/yt-${role}"
 }
 
 update_all(){
@@ -160,6 +168,8 @@ update_all(){
   install -m 755 "$d/yt.sh" "$SELF"
   install -m 755 "$d/yt-main.sh" "$BASE/yt-main.sh"
   install -m 755 "$d/yt-exit.sh" "$BASE/yt-exit.sh"
+  ln -sfn "$BASE/yt-main.sh" /usr/local/bin/yt-main
+  ln -sfn "$BASE/yt-exit.sh" /usr/local/bin/yt-exit
 
   rm -rf "$d"
   trap - RETURN

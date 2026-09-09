@@ -1,548 +1,198 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+VERSION="7.5.0-base"
+IF=ytwg0; STATE=/etc/yt-v7; ROLE_FILE=$STATE/role; PEERS=$STATE/peers
+CONF=/etc/wireguard/$IF.conf; SYSCTL=/etc/sysctl.d/99-yt-v7-forward.conf; BASE_CONF=$STATE/exit-base.env
+die(){ echo "[ERROR] $*" >&2; exit 1; }; ok(){ echo "[OK] $*"; }; warn(){ echo "[WARN] $*"; }
 
-VERSION="6.8.0"
-
-YT_REPO_OWNER="${YT_REPO_OWNER:-Luanhoangkaki}"
-YT_REPO_NAME="${YT_REPO_NAME:-NA88}"
-YT_REPO_REF="${YT_REPO_REF:-main}"
-YT_GH_ENV="/etc/yt-manager/github.env"
-
-load_gh_token(){
-  if [[ -z "${GH_TOKEN:-}" && -f "$YT_GH_ENV" ]]; then
-    source "$YT_GH_ENV"
-  fi
+apt_busy() {
+  command -v fuser >/dev/null 2>&1 || return 1
+  fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock >/dev/null 2>&1
 }
-
-need_gh_token(){
-  load_gh_token
-  [[ -n "${GH_TOKEN:-}" ]] || die "Chưa có GitHub token. Chạy lệnh yt rồi vào mục GitHub token."
-}
-
-gh_raw_download(){
-  local path="$1" out="$2"
-  need_gh_token
-  curl -4fsSL --retry 3 --connect-timeout 10     -H "Authorization: Bearer $GH_TOKEN"     -H "Accept: application/vnd.github.raw+json"     "https://api.github.com/repos/${YT_REPO_OWNER}/${YT_REPO_NAME}/contents/${path}?ref=${YT_REPO_REF}"     -o "$out"
-}
-
-gh_release_asset_download(){
-  local asset_name="$1" out="$2"
-  need_gh_token
-  local meta="/tmp/yt-release.$$.json" asset_id
-  curl -4fsSL --retry 3 --connect-timeout 10     -H "Authorization: Bearer $GH_TOKEN"     -H "Accept: application/vnd.github+json"     "https://api.github.com/repos/${YT_REPO_OWNER}/${YT_REPO_NAME}/releases/latest"     -o "$meta" || { rm -f "$meta"; die "Không đọc được GitHub Release latest."; }
-
-  asset_id="$(python3 - "$meta" "$asset_name" <<'PY'
-import json,sys
-data=json.load(open(sys.argv[1]))
-name=sys.argv[2]
-for a in data.get("assets",[]):
-    if a.get("name")==name:
-        print(a.get("id",""))
-        break
-PY
-)"
-  rm -f "$meta"
-  [[ -n "$asset_id" ]] || die "Không thấy Release asset: $asset_name"
-
-  curl -4fL --retry 3 --connect-timeout 10     -H "Authorization: Bearer $GH_TOKEN"     -H "Accept: application/octet-stream"     "https://api.github.com/repos/${YT_REPO_OWNER}/${YT_REPO_NAME}/releases/assets/${asset_id}"     -o "$out" || die "Không tải được Release asset: $asset_name"
-}
-
-SELF_URL="https://raw.githubusercontent.com/Luanhoangkaki/NA88/main/yt-exit.sh"
-
-WG_IF="ytwg0"
-WG_DIR="/etc/wireguard"
-WG_CONF="$WG_DIR/${WG_IF}.conf"
-STATE_DIR="/etc/yt-exit"
-STATE_FILE="$STATE_DIR/state.env"
-PEER_DIR="$STATE_DIR/peers"
-SYSCTL_FILE="/etc/sysctl.d/99-yt-exit.conf"
-
-DEFAULT_PORT="44443"
-DEFAULT_EXIT_IP="10.88.0.1"
-DEFAULT_PREFIX="24"
-DEFAULT_MTU="1380"
-
-GREEN='\033[32m'; YELLOW='\033[33m'; RED='\033[31m'; CYAN='\033[36m'; RESET='\033[0m'
-ok(){ echo -e "${GREEN}[OK]${RESET} $*"; }
-info(){ echo -e "${CYAN}[INFO]${RESET} $*"; }
-warn(){ echo -e "${YELLOW}[WARN]${RESET} $*"; }
-die(){ echo -e "${RED}[ERROR]${RESET} $*" >&2; exit 1; }
-
-need_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || die "Hãy chạy bằng root."; }
-load_state(){ [[ -f "$STATE_FILE" ]] || return 1; source "$STATE_FILE"; }
-
-valid_ipv4(){
-  local ip="$1" a b c d x
-  IFS=. read -r a b c d <<<"$ip"
-  for x in "$a" "$b" "$c" "$d"; do
-    [[ "$x" =~ ^[0-9]{1,3}$ ]] || return 1
-    (( 10#$x >= 0 && 10#$x <= 255 )) || return 1
+wait_apt_short() {
+  local n=0
+  while apt_busy && (( n < 20 )); do
+    ((n++))
+    echo "[WAIT] APT đang bận... ${n}/20"
+    sleep 3
   done
-  [[ "$ip" == "$a.$b.$c.$d" ]]
+  ! apt_busy
 }
-
-detect_out_if(){ ip -4 route show default | awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'; }
-default_route(){ ip -4 route show default | head -1; }
-public_ip(){ curl -4fsS --max-time 6 https://api.ipify.org 2>/dev/null || curl -4fsS --max-time 6 https://ifconfig.me 2>/dev/null || true; }
-
-
-apt_retry(){
-  local max_wait=600 waited=0 rc out
-  while true; do
-    out="$("$@" 2>&1)" && { printf '%s\n' "$out"; return 0; }
-    rc=$?
-
-    if grep -Eqi 'Could not get lock|Unable to acquire the dpkg frontend lock|is another process using it|Could not open lock file|frontend lock was locked by another process|locked by another process|Resource temporarily unavailable' <<<"$out"; then
-      (( waited == 0 )) && warn "APT đang bận. Đang chờ tự động..."
-      (( waited < max_wait )) || {
-        printf '%s\n' "$out" >&2
-        die "APT vẫn bị khóa sau ${max_wait}s."
-      }
-      sleep 5
-      waited=$((waited+5))
-      continue
-    fi
-
-    printf '%s\n' "$out" >&2
-    return "$rc"
-  done
-}
-
-install_deps(){
-  command -v apt-get >/dev/null 2>&1 || die "Chỉ hỗ trợ Debian/Ubuntu dùng apt."
-
-  local need=0 cmd
-  for cmd in curl ip wg wg-quick iptables systemctl ss; do
-    command -v "$cmd" >/dev/null 2>&1 || need=1
-  done
-  [[ "$need" -eq 0 ]] && return 0
-
+install_missing() {
+  local pkgs=("$@")
+  ((${#pkgs[@]})) || return 0
+  command -v apt-get >/dev/null 2>&1 || die "Thiếu dependency và hệ thống không có apt-get."
+  wait_apt_short || die "APT đang bận. V7 không kill apt/dpkg và không chờ lâu. Hãy chạy lại sau."
   export DEBIAN_FRONTEND=noninteractive
-
-  apt_retry dpkg --configure -a || die "dpkg --configure -a thất bại."
-  apt_retry apt-get update || die "apt-get update thất bại."
-  apt_retry apt-get install -y \
-    wireguard-tools iptables iproute2 curl ca-certificates procps psmisc \
-    || die "Không cài được dependency EXIT."
-
-  for cmd in curl ip wg wg-quick iptables systemctl ss; do
-    command -v "$cmd" >/dev/null 2>&1 || die "Thiếu dependency EXIT sau khi cài: $cmd"
-  done
-
-  ok "Dependency EXIT đã sẵn sàng."
+  apt-get install -y --no-install-recommends "${pkgs[@]}"
+}
+atomic_write() {
+  local dst="$1" mode="$2" tmp
+  tmp="$(mktemp "${dst}.XXXXXX")"
+  cat >"$tmp"
+  chmod "$mode" "$tmp"
+  mv -f "$tmp" "$dst"
 }
 
-check_exit_subnet_collision(){
-  local pfx existing
-  pfx="${EXIT_TUN_IP%.*}"
-  existing="$(ip -4 route show | grep -E "(^| )${pfx}\.0/${PREFIX}( |$)" || true)"
-  if [[ -n "$existing" ]]; then
-    die "Subnet ${pfx}.0/${PREFIX} đang được dùng: $existing"
-  fi
-  if ip -4 addr show | grep -Eq "inet ${EXIT_TUN_IP}/"; then
-    die "EXIT tunnel IP $EXIT_TUN_IP đã tồn tại trên VPS."
-  fi
+ensure_deps(){
+ local p=()
+ command -v ip >/dev/null || p+=(iproute2)
+ command -v wg >/dev/null || p+=(wireguard-tools)
+ command -v wg-quick >/dev/null || p+=(wireguard-tools)
+ command -v iptables >/dev/null || p+=(iptables)
+ command -v systemctl >/dev/null || die "systemd/systemctl không có."
+ install_missing "${p[@]}"
 }
-
-save_state(){
-  mkdir -p "$STATE_DIR" "$PEER_DIR"
-  chmod 700 "$STATE_DIR" "$PEER_DIR"
-  cat >"$STATE_FILE" <<EOF
-WG_IF='$WG_IF'
-WG_PORT='$WG_PORT'
-EXIT_TUN_IP='$EXIT_TUN_IP'
-PREFIX='$PREFIX'
-WG_MTU='$WG_MTU'
-OUT_IF='$OUT_IF'
-PUBLIC_IP='$PUBLIC_IP'
-DEFAULT_ROUTE_BEFORE='${DEFAULT_ROUTE_BEFORE//\'/}'
-IP_FORWARD_BEFORE='$IP_FORWARD_BEFORE'
-EOF
-  chmod 600 "$STATE_FILE"
+valid_port(){ [[ "$1" =~ ^[0-9]+$ ]] && ((10#$1>=1 && 10#$1<=65535)); }
+valid_ipv4(){ python3 - "$1" <<'PY' >/dev/null 2>&1
+import ipaddress,sys
+ipaddress.IPv4Address(sys.argv[1])
+PY
 }
-
-rebuild_conf(){
-  load_state || die "Chưa cài yt-exit."
-  local priv
-  priv="$(cat "$STATE_DIR/private.key")"
-  cat >"$WG_CONF" <<EOF
+valid_key(){ [[ "$1" =~ ^[A-Za-z0-9+/]{43}=$ ]]; }
+default_route(){ ip -4 route show default | head -1; }
+role_guard(){ local r; r=$(cat "$ROLE_FILE" 2>/dev/null||true); [[ -z "$r" || "$r" == EXIT ]] || die "VPS đã là MAIN."; }
+collision_guard(){ [[ -f "$ROLE_FILE" ]] && return; [[ ! -e "$CONF" ]] || die "$CONF đã tồn tại."; ip link show "$IF" >/dev/null 2>&1 && die "$IF đã tồn tại."; }
+load_base(){ [[ -s "$BASE_CONF" ]] || die "EXIT chưa cài"; source "$BASE_CONF"; }
+write_conf(){
+ load_base; local priv; priv=$(cat "$STATE/exit.key")
+ atomic_write "$CONF" 600 <<EOF
 [Interface]
-Address = ${EXIT_TUN_IP}/${PREFIX}
-MTU = ${WG_MTU}
-ListenPort = ${WG_PORT}
+Address = ${EXIT_IP}/24
+ListenPort = ${PORT}
 PrivateKey = ${priv}
-SaveConfig = false
-
+Table = off
 PostUp = iptables -C FORWARD -i %i -o ${OUT_IF} -j ACCEPT 2>/dev/null || iptables -A FORWARD -i %i -o ${OUT_IF} -j ACCEPT
 PostUp = iptables -C FORWARD -i ${OUT_IF} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i ${OUT_IF} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-PostUp = iptables -t nat -C POSTROUTING -s ${EXIT_TUN_IP%.*}.0/${PREFIX} -o ${OUT_IF} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s ${EXIT_TUN_IP%.*}.0/${PREFIX} -o ${OUT_IF} -j MASQUERADE
+PostUp = iptables -t nat -C POSTROUTING -s ${EXIT_IP%.*}.0/24 -o ${OUT_IF} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s ${EXIT_IP%.*}.0/24 -o ${OUT_IF} -j MASQUERADE
 PostDown = iptables -D FORWARD -i %i -o ${OUT_IF} -j ACCEPT 2>/dev/null || true
 PostDown = iptables -D FORWARD -i ${OUT_IF} -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-PostDown = iptables -t nat -D POSTROUTING -s ${EXIT_TUN_IP%.*}.0/${PREFIX} -o ${OUT_IF} -j MASQUERADE 2>/dev/null || true
+PostDown = iptables -t nat -D POSTROUTING -s ${EXIT_IP%.*}.0/24 -o ${OUT_IF} -j MASQUERADE 2>/dev/null || true
 EOF
-  if compgen -G "$PEER_DIR/*.conf" >/dev/null; then
-    for f in "$PEER_DIR"/*.conf; do
-      echo >>"$WG_CONF"; cat "$f" >>"$WG_CONF"
-    done
-  fi
-  chmod 600 "$WG_CONF"
+ if compgen -G "$PEERS/*.conf" >/dev/null; then for f in "$PEERS"/*.conf; do printf '\n' >>"$CONF"; cat "$f" >>"$CONF"; done; fi
+}
+peer_reload_or_start(){
+ if systemctl is-active --quiet "wg-quick@$IF"; then
+   systemctl reload "wg-quick@$IF"
+ else
+   systemctl enable --now "wg-quick@$IF"
+ fi
+}
+full_apply(){
+ if systemctl is-active --quiet "wg-quick@$IF"; then
+   systemctl restart "wg-quick@$IF"
+ else
+   systemctl enable --now "wg-quick@$IF"
+ fi
 }
 
-reload_wg(){
-  if systemctl is-active --quiet "wg-quick@${WG_IF}"; then
-    local tmp rc
-    tmp="$(mktemp /tmp/yt-wg.XXXXXX)"
-    if ! wg-quick strip "$WG_IF" >"$tmp"; then
-      rm -f "$tmp"
-      return 1
-    fi
-    wg syncconf "$WG_IF" "$tmp"
-    rc=$?
-    rm -f "$tmp"
-    return "$rc"
+restore_exit_state(){
+  local oldf_restore="$1" conf_bak="${2:-}" base_bak="${3:-}" first_install="${4:-0}"
+
+  if [[ -n "$conf_bak" && -f "$conf_bak" ]]; then
+    mv -f "$conf_bak" "$CONF"
   else
-    systemctl start "wg-quick@${WG_IF}"
+    rm -f "$CONF"
   fi
+
+  if [[ -n "$base_bak" && -f "$base_bak" ]]; then
+    mv -f "$base_bak" "$BASE_CONF"
+  else
+    rm -f "$BASE_CONF"
+  fi
+
+  [[ "$first_install" -eq 0 ]] || {
+    rm -f "$ROLE_FILE" "$SYSCTL"
+  }
+
+  sysctl -w "net.ipv4.ip_forward=$oldf_restore" >/dev/null 2>&1 || true
 }
 
-rollback_install(){
-  warn "Rollback cài EXIT..."
+install_exit(){
+ [[ $EUID -eq 0 ]] || die "Chạy root"; ensure_deps; role_guard; collision_guard
+ command -v python3 >/dev/null || install_missing python3
+ local port eip oif before after oldf bak="" base_bak="" first_install=0
+ [[ -f "$ROLE_FILE" ]] || first_install=1
+ read -rp "Port [44443]: " port; port=${port:-44443}; read -rp "EXIT tunnel IP [10.88.0.1]: " eip; eip=${eip:-10.88.0.1}
+ valid_port "$port"||die "Port sai"; valid_ipv4 "$eip"||die "IP sai"
+ oif=$(ip route show default|awk 'NR==1{for(i=1;i<=NF;i++)if($i=="dev"){print $(i+1);exit}}'); [[ -n "$oif" ]]||die "Không có OUT IF"
+ mkdir -p "$STATE" "$PEERS" /etc/wireguard; chmod 700 "$STATE" "$PEERS" /etc/wireguard
+ [[ -s "$STATE/exit.key" ]]||(umask 077; wg genkey >"$STATE/exit.key"); wg pubkey <"$STATE/exit.key" >"$STATE/exit.pub"
+ oldf=$(sysctl -n net.ipv4.ip_forward 2>/dev/null||echo 0)
+ [[ -f "$CONF" ]] && { bak="$CONF.bak.$(date +%s)"; cp -a "$CONF" "$bak"; }
 
-  systemctl disable --now "wg-quick@${WG_IF}" >/dev/null 2>&1 || true
+ # Preserve the first pre-YT ip_forward value forever across reinstalls.
+ if [[ -s "$BASE_CONF" ]]; then
+   base_bak="$BASE_CONF.bak.$(date +%s)"
+   cp -a "$BASE_CONF" "$base_bak"
+   # shellcheck disable=SC1090
+   source "$BASE_CONF"
+   oldf="${IP_FORWARD_BEFORE:-$oldf}"
+ fi
 
-  # Dọn rule fallback trong trường hợp service đã chết trước khi PostDown chạy.
-  if command -v iptables >/dev/null 2>&1 && [[ -n "${OUT_IF:-}" && -n "${EXIT_TUN_IP:-}" && -n "${PREFIX:-}" ]]; then
-    while iptables -D FORWARD -i "$WG_IF" -o "$OUT_IF" -j ACCEPT 2>/dev/null; do :; done
-    while iptables -D FORWARD -i "$OUT_IF" -o "$WG_IF" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; do :; done
-    while iptables -t nat -D POSTROUTING -s "${EXIT_TUN_IP%.*}.0/${PREFIX}" -o "$OUT_IF" -j MASQUERADE 2>/dev/null; do :; done
-  fi
-
-  rm -f "$WG_CONF" "$SYSCTL_FILE"
-
-  if [[ -n "${IP_FORWARD_BEFORE:-}" ]]; then
-    sysctl -w "net.ipv4.ip_forward=${IP_FORWARD_BEFORE}" >/dev/null 2>&1 || true
-  fi
-
-  rm -rf "$STATE_DIR"
-  ok "Đã rollback EXIT."
+ atomic_write "$BASE_CONF" 600 <<EOF
+PORT='$port'
+EXIT_IP='$eip'
+OUT_IF='$oif'
+IP_FORWARD_BEFORE='$oldf'
+EOF
+ printf 'EXIT\n' >"$ROLE_FILE"; write_conf
+ printf 'net.ipv4.ip_forward=1\n' >"$SYSCTL"; sysctl -w net.ipv4.ip_forward=1 >/dev/null
+ before=$(default_route)
+ if ! full_apply; then
+   if [[ -n "$bak" ]]; then
+     mv -f "$bak" "$CONF"
+     systemctl restart "wg-quick@$IF" >/dev/null 2>&1 || true
+   else
+     systemctl disable --now "wg-quick@$IF" >/dev/null 2>&1 || true
+     rm -f "$CONF"
+   fi
+   rm -f "$SYSCTL" "$ROLE_FILE" "$BASE_CONF"
+   sysctl -w "net.ipv4.ip_forward=$oldf" >/dev/null 2>&1 || true
+   die "Apply EXIT lỗi; đã rollback toàn bộ state."
+ fi
+ after=$(default_route)
+ if [[ "$before" != "$after" ]]; then
+   if [[ -n "$bak" ]]; then
+     mv -f "$bak" "$CONF"
+     systemctl restart "wg-quick@$IF" >/dev/null 2>&1 || true
+   else
+     systemctl disable --now "wg-quick@$IF" >/dev/null 2>&1 || true
+     rm -f "$CONF"
+   fi
+   rm -f "$SYSCTL" "$ROLE_FILE" "$BASE_CONF"
+   sysctl -w "net.ipv4.ip_forward=$oldf" >/dev/null 2>&1 || true
+   die "Default route đổi; đã rollback toàn bộ EXIT."
+ fi
+ [[ -z "$bak" ]] || rm -f "$bak"
+ [[ -z "$base_bak" ]] || rm -f "$base_bak"
+ ok "EXIT BASE active"; echo "EXIT Public Key: $(cat "$STATE/exit.pub")"; echo "UDP Port: $port"
+ echo "[INFO] Script không tự sửa firewall INPUT. Nếu handshake lỗi, kiểm tra UDP $port."
 }
-
-cmd_install(){
-  need_root; install_deps
-  if [[ -f "$STATE_FILE" ]]; then warn "yt-exit đã được cài."; cmd_info; return 0; fi
-
-  OUT_IF="$(detect_out_if)"
-  [[ -n "$OUT_IF" ]] || die "Không phát hiện default interface."
-  DEFAULT_ROUTE_BEFORE="$(default_route)"
-  PUBLIC_IP="$(public_ip)"
-  IP_FORWARD_BEFORE="$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo 0)"
-  valid_ipv4 "$PUBLIC_IP" || warn "Không tự xác định được Public IPv4; lệnh info sẽ hiện unknown."
-
-  read -rp "WireGuard port [${DEFAULT_PORT}]: " WG_PORT
-  WG_PORT="${WG_PORT:-$DEFAULT_PORT}"
-  read -rp "EXIT tunnel IP [${DEFAULT_EXIT_IP}]: " EXIT_TUN_IP
-  EXIT_TUN_IP="${EXIT_TUN_IP:-$DEFAULT_EXIT_IP}"
-  PREFIX="$DEFAULT_PREFIX"
-  WG_MTU="${YT_WG_MTU:-$DEFAULT_MTU}"
-
-  [[ "$WG_PORT" =~ ^[0-9]+$ ]] && (( WG_PORT >= 1 && WG_PORT <= 65535 )) || die "WireGuard port không hợp lệ."
-  valid_ipv4 "$EXIT_TUN_IP" || die "EXIT tunnel IP không hợp lệ."
-  [[ "$WG_MTU" =~ ^[0-9]+$ ]] && (( WG_MTU >= 1280 && WG_MTU <= 1500 )) || die "MTU không hợp lệ (1280-1500)."
-
-  check_exit_subnet_collision
-
-  ss -Hlun 2>/dev/null | awk '{print $5}' | grep -Eq "[:.]${WG_PORT}$" && die "UDP port $WG_PORT đang được sử dụng."
-  ip link show "$WG_IF" >/dev/null 2>&1 && die "Interface $WG_IF đã tồn tại."
-  [[ ! -f /etc/yt-main/state.env ]] || die "VPS này đang cài yt-main."
-  ip route show table 188 2>/dev/null | grep -q . && warn "Routing table 188 đang có dữ liệu; EXIT không dùng table này nhưng hãy kiểm tra hệ thống."
-
-  mkdir -p "$WG_DIR" "$STATE_DIR" "$PEER_DIR"
-  chmod 700 "$WG_DIR" "$STATE_DIR" "$PEER_DIR"
-
-  local priv pub
-  priv="$(wg genkey)"
-  pub="$(printf '%s' "$priv" | wg pubkey)"
-  printf '%s\n' "$priv" >"$STATE_DIR/private.key"
-  printf '%s\n' "$pub" >"$STATE_DIR/public.key"
-  chmod 600 "$STATE_DIR/private.key"; chmod 644 "$STATE_DIR/public.key"
-
-  save_state; rebuild_conf
-  echo 'net.ipv4.ip_forward=1' >"$SYSCTL_FILE"
-  sysctl -p "$SYSCTL_FILE" >/dev/null
-
-  if ! systemctl enable --now "wg-quick@${WG_IF}" >/dev/null; then
-    rollback_install
-    die "Không khởi động được WireGuard EXIT."
-  fi
-  sleep 1
-
-  if [[ "$(default_route)" != "$DEFAULT_ROUTE_BEFORE" ]]; then
-    rollback_install
-    die "Default route bị thay đổi. Đã rollback toàn bộ cài EXIT."
-  fi
-
-  if ! systemctl is-active --quiet "wg-quick@${WG_IF}"; then
-    rollback_install
-    die "WireGuard EXIT không active. Đã rollback."
-  fi
-
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
-    if ! ufw status 2>/dev/null | grep -Eq "${WG_PORT}/udp.*ALLOW"; then
-      warn "UFW đang ACTIVE nhưng chưa thấy ALLOW ${WG_PORT}/udp."
-      warn "Nếu MAIN không handshake, hãy mở UDP ${WG_PORT} ở UFW và firewall nhà cung cấp."
-    fi
-  fi
-
-  ok "VPS EXIT đã sẵn sàng."
-  cmd_info
-}
-
-cmd_info(){
-  need_root; load_state || die "Chưa cài yt-exit."
-  echo
-  echo "===== YT EXIT INFO ====="
-  echo "Public IP : ${PUBLIC_IP:-unknown}"
-  echo "Public Key: $(cat "$STATE_DIR/public.key")"
-  echo "Port      : $WG_PORT"
-  echo "Tunnel IP : $EXIT_TUN_IP"
-  echo "Interface : $WG_IF"
-  echo "Out IF    : $OUT_IF"
-}
-
-next_ip(){
-  load_state || die "Chưa cài yt-exit."
-  local prefix used i
-  prefix="${EXIT_TUN_IP%.*}"
-  used="$(grep -h '^AllowedIPs' "$PEER_DIR"/*.conf 2>/dev/null | sed -E 's/.*= *([^/]+).*/\1/' || true)"
-  for i in $(seq 2 254); do
-    if ! grep -qx "${prefix}.${i}" <<<"$used"; then echo "${prefix}.${i}"; return; fi
-  done
-  die "Không còn IP tunnel trống."
-}
-
-safe_name(){ tr -cd 'A-Za-z0-9_.-' <<<"$1"; }
-
-cmd_add(){
-  need_root; load_state || die "Chưa cài yt-exit."
-  local name="${1:-}" pubkey="${2:-}" ip="${3:-}"
-  [[ -n "$name" ]] || read -rp "Tên VPS MAIN: " name
-  [[ -n "$pubkey" ]] || read -rp "Public Key của VPS MAIN: " pubkey
-  name="$(safe_name "$name")"
-  [[ -n "$name" ]] || die "Tên MAIN không hợp lệ."
-  [[ "$pubkey" =~ ^[A-Za-z0-9+/]{42,44}=$ ]] || die "Public Key không hợp lệ."
-  [[ -n "$ip" ]] || ip="$(next_ip)"
-  ip="${ip%/32}"
-  valid_ipv4 "$ip" || die "Tunnel IP MAIN không hợp lệ."
-  [[ "${ip%.*}" == "${EXIT_TUN_IP%.*}" ]] || die "MAIN tunnel IP phải cùng subnet /24 với EXIT."
-  [[ "$ip" != "$EXIT_TUN_IP" ]] || die "MAIN không được dùng cùng tunnel IP với EXIT."
-
-  grep -R -Fq "$pubkey" "$PEER_DIR" 2>/dev/null && die "Public Key đã tồn tại."
-  grep -R -Fq "AllowedIPs = ${ip}/32" "$PEER_DIR" 2>/dev/null && die "Tunnel IP đã được dùng."
-
-  local peer_file="$PEER_DIR/${name}.conf"
-  cat >"$peer_file" <<EOF
-# MAIN: $name
+add_main(){
+ [[ $EUID -eq 0 ]]||die "Chạy root"; ensure_deps; role_guard; load_base; command -v python3 >/dev/null||install_missing python3
+ local n pub mip f bak; read -rp "Tên MAIN [MAIN-01]: " n; n=${n:-MAIN-01}; n=$(tr -cd A-Za-z0-9_.-<<<"$n"); [[ -n "$n" ]]||die "Tên sai"
+ read -rp "MAIN Public Key: " pub; read -rp "MAIN tunnel IP [10.88.0.2]: " mip; mip=${mip:-10.88.0.2}
+ valid_key "$pub"||die "Key sai"; valid_ipv4 "$mip"||die "IP sai"; [[ "$mip" != "$EXIT_IP" ]]||die "IP trùng EXIT"
+ f="$PEERS/$n.conf"; bak="$f.bak"; [[ -f "$f" ]]&&cp -a "$f" "$bak"
+ atomic_write "$f" 600 <<EOF
 [Peer]
-PublicKey = $pubkey
-AllowedIPs = ${ip}/32
+PublicKey = $pub
+AllowedIPs = ${mip}/32
 EOF
-  chmod 600 "$peer_file"
-
-  rebuild_conf
-  if ! reload_wg; then
-    rm -f "$peer_file"
-    rebuild_conf
-    reload_wg >/dev/null 2>&1 || true
-    die "Không reload được WireGuard. Đã rollback peer $name."
-  fi
-
-  ok "Đã thêm $name."
-  echo "MAIN_TUNNEL_IP=$ip"
-  echo "Trên VPS MAIN chạy: yt-main activate $ip"
+ write_conf
+ if ! peer_reload_or_start; then [[ -f "$bak" ]]&&mv -f "$bak" "$f"||rm -f "$f"; write_conf; peer_reload_or_start >/dev/null 2>&1||true; die "Peer apply lỗi; rollback."; fi
+ rm -f "$bak"; ok "Đã thêm MAIN"
 }
-
-cmd_remove(){
-  need_root; load_state || die "Chưa cài yt-exit."
-  local name="${1:-}"
-  [[ -n "$name" ]] || read -rp "Tên MAIN cần xóa: " name
-  name="$(safe_name "$name")"
-  local peer_file="$PEER_DIR/${name}.conf"
-  [[ -f "$peer_file" ]] || die "Không tìm thấy MAIN $name."
-
-  local backup="/tmp/yt-peer-${name}.$$"
-  cp -a "$peer_file" "$backup"
-  rm -f "$peer_file"
-  rebuild_conf
-
-  if ! reload_wg; then
-    cp -a "$backup" "$peer_file"
-    rebuild_conf
-    reload_wg >/dev/null 2>&1 || true
-    rm -f "$backup"
-    die "Không reload được WireGuard. Đã khôi phục MAIN $name."
-  fi
-
-  rm -f "$backup"
-  ok "Đã xóa $name."
+status(){ echo "WG: $(systemctl is-active wg-quick@$IF 2>/dev/null||true)"; echo "ip_forward=$(sysctl -n net.ipv4.ip_forward 2>/dev/null||true)"; default_route; wg show "$IF" 2>/dev/null||true; }
+uninstall_exit(){
+ [[ $EUID -eq 0 ]]||die "Chạy root"; role_guard; local old=1
+ if [[ -s "$BASE_CONF" ]]; then source "$BASE_CONF"; old=${IP_FORWARD_BEFORE:-1}; fi
+ systemctl disable --now wg-quick@$IF >/dev/null 2>&1||true
+ rm -f "$CONF" "$SYSCTL"
+ # Conservative ownership: never force forwarding OFF. Only restore 1 if it was already 1.
+ [[ "$old" == 1 ]]&&sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1||true
+ rm -rf "$STATE"; ok "Đã gỡ EXIT. Không ép ip_forward về 0."
 }
-
-cmd_list(){
-  need_root; load_state || die "Chưa cài yt-exit."
-  echo "===== MAIN PEERS ====="
-  if ! compgen -G "$PEER_DIR/*.conf" >/dev/null; then echo "Chưa có MAIN."; return; fi
-  for f in "$PEER_DIR"/*.conf; do
-    echo "--- $(basename "$f" .conf) ---"
-    grep -E '^(PublicKey|AllowedIPs)' "$f"
-  done
-}
-
-cmd_status(){
-  need_root; load_state || die "Chưa cài yt-exit."
-  echo "===== SERVICE ====="
-  systemctl is-enabled "wg-quick@${WG_IF}" 2>/dev/null || true
-  systemctl is-active "wg-quick@${WG_IF}" 2>/dev/null || true
-  echo; echo "===== DEFAULT ROUTE ====="; default_route
-  echo; echo "===== WG ====="; wg show "$WG_IF" 2>/dev/null || true
-  echo; echo "===== FORWARD/NAT ====="
-  sysctl net.ipv4.ip_forward
-  iptables -t nat -S POSTROUTING | grep -F "${EXIT_TUN_IP%.*}.0/${PREFIX}" || true
-}
-
-cmd_test(){
-  need_root; load_state || die "Chưa cài yt-exit."
-  local fail=0 current_if
-  systemctl is-active --quiet "wg-quick@${WG_IF}" && ok "WireGuard active" || { warn "WireGuard inactive"; fail=1; }
-  [[ "$(sysctl -n net.ipv4.ip_forward)" == "1" ]] && ok "ip_forward=1" || { warn "ip_forward sai"; fail=1; }
-  current_if="$(detect_out_if)"
-  [[ "$current_if" == "$OUT_IF" ]] && ok "Default interface vẫn là $OUT_IF" || { warn "Default interface đổi thành $current_if"; fail=1; }
-  iptables -t nat -S POSTROUTING | grep -Fq "${EXIT_TUN_IP%.*}.0/${PREFIX}" && ok "NAT tồn tại" || { warn "NAT thiếu"; fail=1; }
-
-  if compgen -G "$PEER_DIR/*.conf" >/dev/null; then
-    if wg show "$WG_IF" latest-handshakes 2>/dev/null | awk '$2 > 0 {ok=1} END{exit !ok}'; then
-      ok "Có MAIN đã handshake"
-    else
-      warn "Đã có MAIN nhưng chưa thấy handshake"
-      fail=1
-    fi
-  fi
-  return "$fail"
-}
-
-cmd_uninstall(){
-  need_root; load_state || true
-  warn "Đang gỡ yt-exit..."
-  systemctl disable --now "wg-quick@${WG_IF}" >/dev/null 2>&1 || true
-
-  # Fallback cleanup nếu service chết trước khi PostDown chạy.
-  if command -v iptables >/dev/null 2>&1 && [[ -n "${OUT_IF:-}" && -n "${EXIT_TUN_IP:-}" && -n "${PREFIX:-}" ]]; then
-    while iptables -D FORWARD -i "$WG_IF" -o "$OUT_IF" -j ACCEPT 2>/dev/null; do :; done
-    while iptables -D FORWARD -i "$OUT_IF" -o "$WG_IF" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; do :; done
-    while iptables -t nat -D POSTROUTING -s "${EXIT_TUN_IP%.*}.0/${PREFIX}" -o "$OUT_IF" -j MASQUERADE 2>/dev/null; do :; done
-  fi
-
-  rm -f "$WG_CONF" "$SYSCTL_FILE"
-
-  if [[ -n "${IP_FORWARD_BEFORE:-}" ]]; then
-    sysctl -w "net.ipv4.ip_forward=${IP_FORWARD_BEFORE}" >/dev/null 2>&1 || true
-  fi
-
-  rm -rf "$STATE_DIR"
-  ok "Đã gỡ yt-exit và khôi phục ip_forward trước khi cài."
-}
-
-
-cmd_version(){
-  echo "YT EXIT v${VERSION}"
-}
-
-cmd_update(){
-  need_root
-  local tmp="/tmp/yt-exit.sh.$$"
-  info "Đang tải yt-exit mới từ Git private..."
-  gh_raw_download "yt-exit.sh" "$tmp"
-  bash -n "$tmp" || { rm -f "$tmp"; die "File mới lỗi cú pháp."; }
-  install -m 755 "$tmp" /usr/local/lib/yt-manager/yt-exit.sh
-  rm -f "$tmp"
-  ok "Đã cập nhật yt-exit."
-}
-
-menu(){
-  while true; do
-    clear 2>/dev/null || true
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "       YT EXIT v${VERSION}"
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    printf "WG : "
-    systemctl is-active --quiet "wg-quick@${WG_IF}" 2>/dev/null && echo "ACTIVE" || echo "OFF"
-    echo
-    echo "1) Cài EXIT"
-    echo "2) Thông tin"
-    echo "3) Thêm MAIN"
-    echo "4) Xóa MAIN"
-    echo "5) Danh sách MAIN"
-    echo "6) Trạng thái"
-    echo "7) Kiểm tra"
-    echo "8) Cập nhật lệnh"
-    echo "9) Gỡ"
-    echo "0) Thoát"
-    echo
-    read -rp "Chọn: " c
-    case "$c" in
-      1)
-        if [[ -f "$STATE_FILE" ]]; then
-          ok "YT EXIT đã được cài."
-          cmd_info || true
-        else
-          cmd_install || true
-        fi
-        ;;
-      2) cmd_info || true ;;
-      3) cmd_add || true ;;
-      4) cmd_remove || true ;;
-      5) cmd_list || true ;;
-      6) cmd_status || true ;;
-      7) cmd_test || true ;;
-      8) cmd_update || true ;;
-      9)
-        read -rp "Gỡ YT EXIT? [y/N]: " y
-        [[ "$y" =~ ^[Yy]$ ]] && cmd_uninstall || true
-        ;;
-      0) return 0 ;;
-      *) warn "Lựa chọn không hợp lệ." ;;
-    esac
-    echo
-    read -rp "Enter để tiếp tục..." _
-  done
-}
-
-usage(){
-  cat <<EOF
-YT EXIT - VPS chuyên làm cổng ra YouTube
-
-  yt-exit install
-  yt-exit info
-  yt-exit add [MAIN_NAME] [MAIN_PUBLIC_KEY] [MAIN_TUNNEL_IP]
-  yt-exit remove [MAIN_NAME]
-  yt-exit list
-  yt-exit status
-  yt-exit test
-  yt-exit update
-  yt-exit version
-  yt-exit uninstall
-EOF
-}
-
-case "${1:-}" in
-  "") menu ;;
-  install) shift; cmd_install "$@" ;;
-  info) shift; cmd_info "$@" ;;
-  add) shift; cmd_add "$@" ;;
-  remove) shift; cmd_remove "$@" ;;
-  list) shift; cmd_list "$@" ;;
-  status) shift; cmd_status "$@" ;;
-  test) shift; cmd_test "$@" ;;
-  update) shift; cmd_update "$@" ;;
-  version) shift; cmd_version "$@" ;;
-  uninstall) shift; cmd_uninstall "$@" ;;
-  *) usage ;;
-esac
+menu(){ while true; do echo "YT V7 EXIT $VERSION"; echo "1) Cài/Cập nhật EXIT"; echo "2) Thêm MAIN"; echo "3) Trạng thái"; echo "4) Gỡ"; echo "0) Thoát"; read -rp "Chọn: " x; case $x in 1) install_exit;;2)add_main;;3)status;;4)uninstall_exit;;0)exit;;esac; done; }
+case "${1:-menu}" in install)install_exit;;add-main)add_main;;status)status;;uninstall)uninstall_exit;;*)menu;;esac

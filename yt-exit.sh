@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-VERSION="7.5.0-base"
+VERSION="7.7.0-base"
 IF=ytwg0; STATE=/etc/yt-v7; ROLE_FILE=$STATE/role; PEERS=$STATE/peers
 CONF=/etc/wireguard/$IF.conf; SYSCTL=/etc/sysctl.d/99-yt-v7-forward.conf; BASE_CONF=$STATE/exit-base.env
 die(){ echo "[ERROR] $*" >&2; exit 1; }; ok(){ echo "[OK] $*"; }; warn(){ echo "[WARN] $*"; }
@@ -51,8 +51,20 @@ PY
 }
 valid_key(){ [[ "$1" =~ ^[A-Za-z0-9+/]{43}=$ ]]; }
 default_route(){ ip -4 route show default | head -1; }
-role_guard(){ local r; r=$(cat "$ROLE_FILE" 2>/dev/null||true); [[ -z "$r" || "$r" == EXIT ]] || die "VPS đã là MAIN."; }
-collision_guard(){ [[ -f "$ROLE_FILE" ]] && return; [[ ! -e "$CONF" ]] || die "$CONF đã tồn tại."; ip link show "$IF" >/dev/null 2>&1 && die "$IF đã tồn tại."; }
+role_guard(){
+  local r
+  r=$(cat "$ROLE_FILE" 2>/dev/null || true)
+  [[ -z "$r" || "$r" == EXIT ]] || die "VPS đã là MAIN."
+  return 0
+}
+collision_guard(){
+  [[ -f "$ROLE_FILE" ]] && return 0
+  [[ ! -e "$CONF" ]] || die "$CONF đã tồn tại."
+  if ip link show "$IF" >/dev/null 2>&1; then
+    die "$IF đã tồn tại."
+  fi
+  return 0
+}
 load_base(){ [[ -s "$BASE_CONF" ]] || die "EXIT chưa cài"; source "$BASE_CONF"; }
 write_conf(){
  load_base; local priv; priv=$(cat "$STATE/exit.key")
@@ -109,81 +121,180 @@ restore_exit_state(){
 }
 
 install_exit(){
- [[ $EUID -eq 0 ]] || die "Chạy root"; ensure_deps; role_guard; collision_guard
- command -v python3 >/dev/null || install_missing python3
- local port eip oif before after oldf bak="" base_bak="" first_install=0
- [[ -f "$ROLE_FILE" ]] || first_install=1
- read -rp "Port [44443]: " port; port=${port:-44443}; read -rp "EXIT tunnel IP [10.88.0.1]: " eip; eip=${eip:-10.88.0.1}
- valid_port "$port"||die "Port sai"; valid_ipv4 "$eip"||die "IP sai"
- oif=$(ip route show default|awk 'NR==1{for(i=1;i<=NF;i++)if($i=="dev"){print $(i+1);exit}}'); [[ -n "$oif" ]]||die "Không có OUT IF"
- mkdir -p "$STATE" "$PEERS" /etc/wireguard; chmod 700 "$STATE" "$PEERS" /etc/wireguard
- [[ -s "$STATE/exit.key" ]]||(umask 077; wg genkey >"$STATE/exit.key"); wg pubkey <"$STATE/exit.key" >"$STATE/exit.pub"
- oldf=$(sysctl -n net.ipv4.ip_forward 2>/dev/null||echo 0)
- [[ -f "$CONF" ]] && { bak="$CONF.bak.$(date +%s)"; cp -a "$CONF" "$bak"; }
+  [[ $EUID -eq 0 ]] || die "Chạy root"
+  ensure_deps
+  role_guard
+  collision_guard
+  command -v python3 >/dev/null || install_missing python3
 
- # Preserve the first pre-YT ip_forward value forever across reinstalls.
- if [[ -s "$BASE_CONF" ]]; then
-   base_bak="$BASE_CONF.bak.$(date +%s)"
-   cp -a "$BASE_CONF" "$base_bak"
-   # shellcheck disable=SC1090
-   source "$BASE_CONF"
-   oldf="${IP_FORWARD_BEFORE:-$oldf}"
- fi
+  local port eip oif before after oldf
+  local conf_bak="" base_bak="" first_install=0
+  [[ -f "$ROLE_FILE" ]] || first_install=1
 
- atomic_write "$BASE_CONF" 600 <<EOF
+  read -rp "Port [44443]: " port
+  port=${port:-44443}
+  read -rp "EXIT tunnel IP [10.88.0.1]: " eip
+  eip=${eip:-10.88.0.1}
+
+  valid_port "$port" || die "Port sai"
+  valid_ipv4 "$eip" || die "IP sai"
+
+  oif=$(ip route show default | awk 'NR==1{for(i=1;i<=NF;i++)if($i=="dev"){print $(i+1);exit}}')
+  [[ -n "$oif" ]] || die "Không có OUT IF"
+
+  mkdir -p "$STATE" "$PEERS" /etc/wireguard
+  chmod 700 "$STATE" "$PEERS" /etc/wireguard
+
+  [[ -s "$STATE/exit.key" ]] || (umask 077; wg genkey >"$STATE/exit.key")
+  wg pubkey <"$STATE/exit.key" >"$STATE/exit.pub"
+
+  oldf=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo 0)
+
+  if [[ -f "$CONF" ]]; then
+    conf_bak="$CONF.bak.$(date +%s)"
+    cp -a "$CONF" "$conf_bak"
+  fi
+
+  # Keep the ORIGINAL forwarding state from the first successful install.
+  if [[ -s "$BASE_CONF" ]]; then
+    base_bak="$BASE_CONF.bak.$(date +%s)"
+    cp -a "$BASE_CONF" "$base_bak"
+    # shellcheck disable=SC1090
+    source "$BASE_CONF"
+    oldf="${IP_FORWARD_BEFORE:-$oldf}"
+  fi
+
+  atomic_write "$BASE_CONF" 600 <<EOF
 PORT='$port'
 EXIT_IP='$eip'
 OUT_IF='$oif'
 IP_FORWARD_BEFORE='$oldf'
 EOF
- printf 'EXIT\n' >"$ROLE_FILE"; write_conf
- printf 'net.ipv4.ip_forward=1\n' >"$SYSCTL"; sysctl -w net.ipv4.ip_forward=1 >/dev/null
- before=$(default_route)
- if ! full_apply; then
-   if [[ -n "$bak" ]]; then
-     mv -f "$bak" "$CONF"
-     systemctl restart "wg-quick@$IF" >/dev/null 2>&1 || true
-   else
-     systemctl disable --now "wg-quick@$IF" >/dev/null 2>&1 || true
-     rm -f "$CONF"
-   fi
-   rm -f "$SYSCTL" "$ROLE_FILE" "$BASE_CONF"
-   sysctl -w "net.ipv4.ip_forward=$oldf" >/dev/null 2>&1 || true
-   die "Apply EXIT lỗi; đã rollback toàn bộ state."
- fi
- after=$(default_route)
- if [[ "$before" != "$after" ]]; then
-   if [[ -n "$bak" ]]; then
-     mv -f "$bak" "$CONF"
-     systemctl restart "wg-quick@$IF" >/dev/null 2>&1 || true
-   else
-     systemctl disable --now "wg-quick@$IF" >/dev/null 2>&1 || true
-     rm -f "$CONF"
-   fi
-   rm -f "$SYSCTL" "$ROLE_FILE" "$BASE_CONF"
-   sysctl -w "net.ipv4.ip_forward=$oldf" >/dev/null 2>&1 || true
-   die "Default route đổi; đã rollback toàn bộ EXIT."
- fi
- [[ -z "$bak" ]] || rm -f "$bak"
- [[ -z "$base_bak" ]] || rm -f "$base_bak"
- ok "EXIT BASE active"; echo "EXIT Public Key: $(cat "$STATE/exit.pub")"; echo "UDP Port: $port"
- echo "[INFO] Script không tự sửa firewall INPUT. Nếu handshake lỗi, kiểm tra UDP $port."
+
+  [[ "$first_install" -eq 0 ]] || printf 'EXIT\n' >"$ROLE_FILE"
+  write_conf
+
+  printf 'net.ipv4.ip_forward=1\n' >"$SYSCTL"
+  sysctl -w net.ipv4.ip_forward=1 >/dev/null
+
+  before=$(default_route)
+
+  if ! full_apply; then
+    systemctl disable --now "wg-quick@$IF" >/dev/null 2>&1 || true
+
+    if [[ -n "$conf_bak" && -f "$conf_bak" ]]; then
+      mv -f "$conf_bak" "$CONF"
+    else
+      rm -f "$CONF"
+    fi
+
+    if [[ -n "$base_bak" && -f "$base_bak" ]]; then
+      mv -f "$base_bak" "$BASE_CONF"
+    else
+      rm -f "$BASE_CONF"
+    fi
+
+    if [[ "$first_install" -eq 1 ]]; then
+      rm -f "$ROLE_FILE" "$SYSCTL"
+    fi
+
+    sysctl -w "net.ipv4.ip_forward=$oldf" >/dev/null 2>&1 || true
+
+    if [[ "$first_install" -eq 0 && -f "$CONF" ]]; then
+      systemctl restart "wg-quick@$IF" >/dev/null 2>&1 || true
+    fi
+
+    die "Apply EXIT lỗi; đã rollback."
+  fi
+
+  after=$(default_route)
+  if [[ "$before" != "$after" ]]; then
+    systemctl disable --now "wg-quick@$IF" >/dev/null 2>&1 || true
+
+    if [[ -n "$conf_bak" && -f "$conf_bak" ]]; then
+      mv -f "$conf_bak" "$CONF"
+    else
+      rm -f "$CONF"
+    fi
+
+    if [[ -n "$base_bak" && -f "$base_bak" ]]; then
+      mv -f "$base_bak" "$BASE_CONF"
+    else
+      rm -f "$BASE_CONF"
+    fi
+
+    if [[ "$first_install" -eq 1 ]]; then
+      rm -f "$ROLE_FILE" "$SYSCTL"
+    fi
+
+    sysctl -w "net.ipv4.ip_forward=$oldf" >/dev/null 2>&1 || true
+
+    if [[ "$first_install" -eq 0 && -f "$CONF" ]]; then
+      systemctl restart "wg-quick@$IF" >/dev/null 2>&1 || true
+    fi
+
+    die "Default route đổi; đã rollback EXIT."
+  fi
+
+  [[ -z "$conf_bak" ]] || rm -f "$conf_bak"
+  [[ -z "$base_bak" ]] || rm -f "$base_bak"
+
+  ok "EXIT BASE active"
+  echo "EXIT Public Key: $(cat "$STATE/exit.pub")"
+  echo "UDP Port: $port"
+  echo "[INFO] Script không tự sửa firewall INPUT. Nếu handshake lỗi, kiểm tra UDP $port."
 }
+
 add_main(){
- [[ $EUID -eq 0 ]]||die "Chạy root"; ensure_deps; role_guard; load_base; command -v python3 >/dev/null||install_missing python3
- local n pub mip f bak; read -rp "Tên MAIN [MAIN-01]: " n; n=${n:-MAIN-01}; n=$(tr -cd A-Za-z0-9_.-<<<"$n"); [[ -n "$n" ]]||die "Tên sai"
- read -rp "MAIN Public Key: " pub; read -rp "MAIN tunnel IP [10.88.0.2]: " mip; mip=${mip:-10.88.0.2}
- valid_key "$pub"||die "Key sai"; valid_ipv4 "$mip"||die "IP sai"; [[ "$mip" != "$EXIT_IP" ]]||die "IP trùng EXIT"
- f="$PEERS/$n.conf"; bak="$f.bak"; [[ -f "$f" ]]&&cp -a "$f" "$bak"
- atomic_write "$f" 600 <<EOF
+  [[ $EUID -eq 0 ]] || die "Chạy root"
+  ensure_deps
+  role_guard
+  load_base
+  command -v python3 >/dev/null || install_missing python3
+
+  local n pub mip f bak=""
+  read -rp "Tên MAIN [MAIN-01]: " n
+  n=${n:-MAIN-01}
+  n=$(tr -cd A-Za-z0-9_.- <<<"$n")
+  [[ -n "$n" ]] || die "Tên sai"
+
+  read -rp "MAIN Public Key: " pub
+  read -rp "MAIN tunnel IP [10.88.0.2]: " mip
+  mip=${mip:-10.88.0.2}
+
+  valid_key "$pub" || die "Key sai"
+  valid_ipv4 "$mip" || die "IP sai"
+  [[ "$mip" != "$EXIT_IP" ]] || die "IP trùng EXIT"
+
+  f="$PEERS/$n.conf"
+  if [[ -f "$f" ]]; then
+    bak="$f.bak.$(date +%s)"
+    cp -a "$f" "$bak"
+  fi
+
+  atomic_write "$f" 600 <<EOF
 [Peer]
 PublicKey = $pub
 AllowedIPs = ${mip}/32
 EOF
- write_conf
- if ! peer_reload_or_start; then [[ -f "$bak" ]]&&mv -f "$bak" "$f"||rm -f "$f"; write_conf; peer_reload_or_start >/dev/null 2>&1||true; die "Peer apply lỗi; rollback."; fi
- rm -f "$bak"; ok "Đã thêm MAIN"
+
+  write_conf
+
+  if ! peer_reload_or_start; then
+    if [[ -n "$bak" && -f "$bak" ]]; then
+      mv -f "$bak" "$f"
+    else
+      rm -f "$f"
+    fi
+    write_conf
+    peer_reload_or_start >/dev/null 2>&1 || true
+    die "Peer apply lỗi; đã rollback."
+  fi
+
+  [[ -z "$bak" ]] || rm -f "$bak"
+  ok "Đã thêm MAIN"
 }
+
 status(){ echo "WG: $(systemctl is-active wg-quick@$IF 2>/dev/null||true)"; echo "ip_forward=$(sysctl -n net.ipv4.ip_forward 2>/dev/null||true)"; default_route; wg show "$IF" 2>/dev/null||true; }
 uninstall_exit(){
  [[ $EUID -eq 0 ]]||die "Chạy root"; role_guard; local old=1

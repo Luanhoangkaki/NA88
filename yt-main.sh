@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-VERSION="7.5.0-base"
+VERSION="7.7.0-base"
 IF=ytwg0; STATE=/etc/yt-v7; ROLE_FILE=$STATE/role; CONF=/etc/wireguard/$IF.conf
 die(){ echo "[ERROR] $*" >&2; exit 1; }; ok(){ echo "[OK] $*"; }; warn(){ echo "[WARN] $*"; }
 
@@ -49,8 +49,20 @@ PY
 }
 valid_key(){ [[ "$1" =~ ^[A-Za-z0-9+/]{43}=$ ]]; }
 default_route(){ ip -4 route show default | head -1; }
-role_guard(){ local r; r=$(cat "$ROLE_FILE" 2>/dev/null||true); [[ -z "$r" || "$r" == MAIN ]] || die "VPS đã là EXIT."; }
-collision_guard(){ [[ -f "$ROLE_FILE" ]] && return; [[ ! -e "$CONF" ]] || die "$CONF đã tồn tại."; ip link show "$IF" >/dev/null 2>&1 && die "$IF đã tồn tại."; }
+role_guard(){
+  local r
+  r=$(cat "$ROLE_FILE" 2>/dev/null || true)
+  [[ -z "$r" || "$r" == MAIN ]] || die "VPS đã là EXIT."
+  return 0
+}
+collision_guard(){
+  [[ -f "$ROLE_FILE" ]] && return 0
+  [[ ! -e "$CONF" ]] || die "$CONF đã tồn tại."
+  if ip link show "$IF" >/dev/null 2>&1; then
+    die "$IF đã tồn tại."
+  fi
+  return 0
+}
 reload_or_start(){
   if systemctl is-active --quiet wg-quick@$IF; then
     systemctl reload wg-quick@$IF

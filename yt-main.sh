@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-VERSION="7.7.0-base"
+VERSION="7.7.2-base"
 IF=ytwg0; STATE=/etc/yt-v7; ROLE_FILE=$STATE/role; CONF=/etc/wireguard/$IF.conf
 die(){ echo "[ERROR] $*" >&2; exit 1; }; ok(){ echo "[OK] $*"; }; warn(){ echo "[WARN] $*"; }
 
@@ -75,7 +75,10 @@ install_main(){
   command -v python3 >/dev/null || install_missing python3
   local eip epub port mip before after priv bak="" first_install=0
   [[ -f "$ROLE_FILE" ]] || first_install=1
-  read -rp "EXIT Public IP: " eip; read -rp "EXIT Public Key: " epub
+  read -rp "EXIT Public IP: " eip
+  read -rp "EXIT Public Key: " epub
+  epub=$(printf '%s' "$epub" | tr -d '[:space:]')
+  echo "[CHECK] EXIT Public Key: $epub"
   read -rp "EXIT Port [44443]: " port; port=${port:-44443}
   read -rp "MAIN tunnel IP [10.88.0.2]: " mip; mip=${mip:-10.88.0.2}
   valid_ipv4 "$eip" || die "EXIT IP sai"; valid_ipv4 "$mip" || die "MAIN IP sai"
@@ -125,7 +128,25 @@ EOF
   fi
 
   [[ -z "$bak" ]] || rm -f "$bak"
-  ok "MAIN BASE active; V2Node untouched."; echo "MAIN Public Key: $(cat "$STATE/main.pub")"
+  ok "MAIN BASE active; V2Node untouched."
+  echo "MAIN Public Key: $(cat "$STATE/main.pub")"
+  echo "[NEXT] Hãy copy trực tiếp dòng MAIN Public Key này sang EXIT; không gõ lại từ ảnh."
+
+  echo "[CHECK] Chờ WireGuard handshake với EXIT (tối đa 15 giây)..."
+  local hs=0 i latest
+  for i in {1..3}; do
+    latest=$(wg show "$IF" latest-handshakes 2>/dev/null | awk -v k="$epub" '$1==k {print $2}')
+    if [[ "$latest" =~ ^[0-9]+$ ]] && (( latest > 0 )); then
+      hs=1
+      break
+    fi
+    sleep 5
+  done
+  if (( hs == 1 )); then
+    echo "[OK] HANDSHAKE PASS - MAIN đã xác thực với EXIT."
+  else
+    echo "[INFO] Chưa có handshake. Nếu EXIT chưa thêm MAIN Public Key ở trên thì đây là bình thường."
+  fi
 }
 status(){ echo "V2Node: $(systemctl is-active v2node 2>/dev/null||true)"; echo "WG: $(systemctl is-active wg-quick@$IF 2>/dev/null||true)"; default_route; wg show "$IF" 2>/dev/null||true; }
 menu(){ while true; do echo "YT V7 MAIN $VERSION"; echo "1) Cài/Cập nhật MAIN"; echo "2) Trạng thái"; echo "0) Thoát"; read -rp "Chọn: " x; case $x in 1) install_main;;2) status;;0) exit;;esac; done; }

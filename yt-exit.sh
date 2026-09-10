@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-VERSION="7.7.0-base"
+VERSION="7.7.2-base"
 IF=ytwg0; STATE=/etc/yt-v7; ROLE_FILE=$STATE/role; PEERS=$STATE/peers
 CONF=/etc/wireguard/$IF.conf; SYSCTL=/etc/sysctl.d/99-yt-v7-forward.conf; BASE_CONF=$STATE/exit-base.env
 die(){ echo "[ERROR] $*" >&2; exit 1; }; ok(){ echo "[OK] $*"; }; warn(){ echo "[WARN] $*"; }
@@ -259,6 +259,8 @@ add_main(){
   [[ -n "$n" ]] || die "Tên sai"
 
   read -rp "MAIN Public Key: " pub
+  pub=$(printf '%s' "$pub" | tr -d '[:space:]')
+  echo "[CHECK] MAIN Public Key: $pub"
   read -rp "MAIN tunnel IP [10.88.0.2]: " mip
   mip=${mip:-10.88.0.2}
 
@@ -291,8 +293,41 @@ EOF
     die "Peer apply lỗi; đã rollback."
   fi
 
+  local applied_pub
+  applied_pub=$(wg show "$IF" peers 2>/dev/null | grep -Fx "$pub" || true)
+  if [[ "$applied_pub" != "$pub" ]]; then
+    if [[ -n "$bak" && -f "$bak" ]]; then
+      mv -f "$bak" "$f"
+    else
+      rm -f "$f"
+    fi
+    write_conf
+    full_apply >/dev/null 2>&1 || true
+    die "Peer key runtime không khớp; đã rollback."
+  fi
+
   [[ -z "$bak" ]] || rm -f "$bak"
   ok "Đã thêm MAIN"
+  echo "[CHECK] MAIN peer runtime: $applied_pub"
+
+  echo "[CHECK] Chờ WireGuard handshake từ MAIN (tối đa 35 giây)..."
+  local hs=0 i latest
+  for i in {1..7}; do
+    latest=$(wg show "$IF" latest-handshakes 2>/dev/null | awk -v k="$pub" '$1==k {print $2}')
+    if [[ "$latest" =~ ^[0-9]+$ ]] && (( latest > 0 )); then
+      hs=1
+      break
+    fi
+    sleep 5
+  done
+
+  if (( hs == 1 )); then
+    echo "[OK] HANDSHAKE PASS - MAIN đã xác thực với EXIT."
+  else
+    echo "[WARN] HANDSHAKE FAIL - chưa thấy MAIN handshake trong 35 giây."
+    echo "[WARN] Peer vẫn được giữ nguyên vì MAIN có thể chưa online/chưa bật ytwg0."
+    echo "[WARN] Hãy kiểm tra MAIN Public Key, endpoint UDP ${PORT}, và chạy trạng thái ở cả hai VPS."
+  fi
 }
 
 status(){ echo "WG: $(systemctl is-active wg-quick@$IF 2>/dev/null||true)"; echo "ip_forward=$(sysctl -n net.ipv4.ip_forward 2>/dev/null||true)"; default_route; wg show "$IF" 2>/dev/null||true; }

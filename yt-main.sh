@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-VERSION="7.7.2-base"
+VERSION="7.7.6-base"
 IF=ytwg0; STATE=/etc/yt-v7; ROLE_FILE=$STATE/role; CONF=/etc/wireguard/$IF.conf
 die(){ echo "[ERROR] $*" >&2; exit 1; }; ok(){ echo "[OK] $*"; }; warn(){ echo "[WARN] $*"; }
 
@@ -11,7 +11,7 @@ apt_busy() {
 wait_apt_short() {
   local n=0
   while apt_busy && (( n < 20 )); do
-    ((n++))
+    ((++n))
     echo "[WAIT] APT đang bận... ${n}/20"
     sleep 3
   done
@@ -23,7 +23,7 @@ install_missing() {
   command -v apt-get >/dev/null 2>&1 || die "Thiếu dependency và hệ thống không có apt-get."
   wait_apt_short || die "APT đang bận. V7 không kill apt/dpkg và không chờ lâu. Hãy chạy lại sau."
   export DEBIAN_FRONTEND=noninteractive
-  apt-get install -y --no-install-recommends "${pkgs[@]}"
+  apt-get install -y --no-install-recommends "${pkgs[@]}" || die "Cài dependency thất bại. Nếu APT đang bận, hãy chạy lại sau."
 }
 atomic_write() {
   local dst="$1" mode="$2" tmp
@@ -63,15 +63,35 @@ collision_guard(){
   fi
   return 0
 }
-reload_or_start(){
-  if systemctl is-active --quiet wg-quick@$IF; then
-    systemctl reload wg-quick@$IF
+apply_main(){
+  if systemctl is-active --quiet "wg-quick@$IF"; then
+    systemctl restart "wg-quick@$IF"
   else
-    systemctl enable --now wg-quick@$IF
+    systemctl enable --now "wg-quick@$IF"
+  fi
+}
+
+restore_main_service_state(){
+  local was_enabled="$1" was_active="$2"
+
+  if [[ "$was_enabled" == "enabled" ]]; then
+    systemctl enable "wg-quick@$IF" >/dev/null 2>&1 || true
+  else
+    systemctl disable "wg-quick@$IF" >/dev/null 2>&1 || true
+  fi
+
+  if [[ "$was_active" == "active" && -f "$CONF" ]]; then
+    systemctl restart "wg-quick@$IF" >/dev/null 2>&1 || true
+  else
+    systemctl stop "wg-quick@$IF" >/dev/null 2>&1 || true
   fi
 }
 install_main(){
-  [[ $EUID -eq 0 ]] || die "Chạy root"; ensure_deps; role_guard; collision_guard
+  [[ $EUID -eq 0 ]] || die "Chạy root"
+  local wg_was_enabled wg_was_active
+  wg_was_enabled=$(systemctl is-enabled "wg-quick@$IF" 2>/dev/null || true)
+  wg_was_active=$(systemctl is-active "wg-quick@$IF" 2>/dev/null || true)
+  ensure_deps; role_guard; collision_guard
   command -v python3 >/dev/null || install_missing python3
   local eip epub port mip before after priv bak="" first_install=0
   [[ -f "$ROLE_FILE" ]] || first_install=1
@@ -102,10 +122,10 @@ PersistentKeepalive = 25
 EOF
   [[ "$first_install" -eq 0 ]] || printf 'MAIN\n' >"$ROLE_FILE"
 
-  if ! reload_or_start; then
+  if ! apply_main; then
     if [[ -n "$bak" ]]; then
       mv -f "$bak" "$CONF"
-      systemctl restart "wg-quick@$IF" >/dev/null 2>&1 || true
+      restore_main_service_state "$wg_was_enabled" "$wg_was_active"
     else
       systemctl disable --now "wg-quick@$IF" >/dev/null 2>&1 || true
       rm -f "$CONF"
@@ -118,7 +138,7 @@ EOF
   if [[ "$before" != "$after" ]]; then
     if [[ -n "$bak" ]]; then
       mv -f "$bak" "$CONF"
-      systemctl restart "wg-quick@$IF" >/dev/null 2>&1 || true
+      restore_main_service_state "$wg_was_enabled" "$wg_was_active"
     else
       systemctl disable --now "wg-quick@$IF" >/dev/null 2>&1 || true
       rm -f "$CONF"
@@ -128,17 +148,29 @@ EOF
   fi
 
   [[ -z "$bak" ]] || rm -f "$bak"
+
+  systemctl enable "wg-quick@$IF" >/dev/null 2>&1 || die "Không thể enable wg-quick@$IF"
+  if ! systemctl is-active --quiet "wg-quick@$IF"; then
+    systemctl start "wg-quick@$IF" >/dev/null 2>&1 || die "Không thể start wg-quick@$IF"
+  fi
+  systemctl is-enabled --quiet "wg-quick@$IF" || die "wg-quick@$IF chưa enabled sau apply."
+  systemctl is-active --quiet "wg-quick@$IF" || die "wg-quick@$IF chưa active sau apply."
+
   ok "MAIN BASE active; V2Node untouched."
   echo "MAIN Public Key: $(cat "$STATE/main.pub")"
   echo "[NEXT] Hãy copy trực tiếp dòng MAIN Public Key này sang EXIT; không gõ lại từ ảnh."
 
   echo "[CHECK] Chờ WireGuard handshake với EXIT (tối đa 15 giây)..."
-  local hs=0 i latest
+  local hs=0 i latest now age
   for i in {1..3}; do
     latest=$(wg show "$IF" latest-handshakes 2>/dev/null | awk -v k="$epub" '$1==k {print $2}')
+    now=$(date +%s)
     if [[ "$latest" =~ ^[0-9]+$ ]] && (( latest > 0 )); then
-      hs=1
-      break
+      age=$((now-latest))
+      if (( age >= 0 && age <= 30 )); then
+        hs=1
+        break
+      fi
     fi
     sleep 5
   done
@@ -149,5 +181,14 @@ EOF
   fi
 }
 status(){ echo "V2Node: $(systemctl is-active v2node 2>/dev/null||true)"; echo "WG: $(systemctl is-active wg-quick@$IF 2>/dev/null||true)"; default_route; wg show "$IF" 2>/dev/null||true; }
-menu(){ while true; do echo "YT V7 MAIN $VERSION"; echo "1) Cài/Cập nhật MAIN"; echo "2) Trạng thái"; echo "0) Thoát"; read -rp "Chọn: " x; case $x in 1) install_main;;2) status;;0) exit;;esac; done; }
-case "${1:-menu}" in install) install_main;;status) status;;*) menu;;esac
+
+uninstall_main(){
+  [[ $EUID -eq 0 ]] || die "Chạy root"
+  role_guard
+  systemctl disable --now "wg-quick@$IF" >/dev/null 2>&1 || true
+  rm -f "$CONF" "$STATE/main.key" "$STATE/main.pub" "$ROLE_FILE"
+  rmdir "$STATE" 2>/dev/null || true
+  ok "Đã gỡ YT MAIN. Không đụng V2Node."
+}
+menu(){ while true; do echo "YT V7 MAIN $VERSION"; echo "1) Cài/Cập nhật MAIN"; echo "2) Trạng thái"; echo "3) Gỡ MAIN"; echo "0) Thoát"; read -rp "Chọn: " x; case $x in 1) install_main;;2) status;;3) uninstall_main;;0) exit;;esac; done; }
+case "${1:-menu}" in install) install_main;;status) status;;uninstall) uninstall_main;;*) menu;;esac

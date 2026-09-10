@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-VERSION="7.7.2-base"
+VERSION="7.7.6-base"
 IF=ytwg0; STATE=/etc/yt-v7; ROLE_FILE=$STATE/role; PEERS=$STATE/peers
 CONF=/etc/wireguard/$IF.conf; SYSCTL=/etc/sysctl.d/99-yt-v7-forward.conf; BASE_CONF=$STATE/exit-base.env
 die(){ echo "[ERROR] $*" >&2; exit 1; }; ok(){ echo "[OK] $*"; }; warn(){ echo "[WARN] $*"; }
@@ -12,7 +12,7 @@ apt_busy() {
 wait_apt_short() {
   local n=0
   while apt_busy && (( n < 20 )); do
-    ((n++))
+    ((++n))
     echo "[WAIT] APT đang bận... ${n}/20"
     sleep 3
   done
@@ -24,7 +24,7 @@ install_missing() {
   command -v apt-get >/dev/null 2>&1 || die "Thiếu dependency và hệ thống không có apt-get."
   wait_apt_short || die "APT đang bận. V7 không kill apt/dpkg và không chờ lâu. Hãy chạy lại sau."
   export DEBIAN_FRONTEND=noninteractive
-  apt-get install -y --no-install-recommends "${pkgs[@]}"
+  apt-get install -y --no-install-recommends "${pkgs[@]}" || die "Cài dependency thất bại. Nếu APT đang bận, hãy chạy lại sau."
 }
 atomic_write() {
   local dst="$1" mode="$2" tmp
@@ -89,6 +89,8 @@ peer_reload_or_start(){
  else
    systemctl enable --now "wg-quick@$IF"
  fi
+ systemctl enable "wg-quick@$IF" >/dev/null 2>&1 || return 1
+ systemctl is-active --quiet "wg-quick@$IF"
 }
 full_apply(){
  if systemctl is-active --quiet "wg-quick@$IF"; then
@@ -96,6 +98,18 @@ full_apply(){
  else
    systemctl enable --now "wg-quick@$IF"
  fi
+}
+
+restore_exit_service_state(){
+  local was_enabled="$1" was_active="$2"
+  if [[ "$was_enabled" == "enabled" ]]; then
+    systemctl enable "wg-quick@$IF" >/dev/null 2>&1 || true
+  else
+    systemctl disable "wg-quick@$IF" >/dev/null 2>&1 || true
+  fi
+  if [[ "$was_active" == "active" && -f "$CONF" ]]; then
+    systemctl restart "wg-quick@$IF" >/dev/null 2>&1 || true
+  fi
 }
 
 restore_exit_state(){
@@ -122,6 +136,9 @@ restore_exit_state(){
 
 install_exit(){
   [[ $EUID -eq 0 ]] || die "Chạy root"
+  local wg_was_enabled wg_was_active
+  wg_was_enabled=$(systemctl is-enabled "wg-quick@$IF" 2>/dev/null || true)
+  wg_was_active=$(systemctl is-active "wg-quick@$IF" 2>/dev/null || true)
   ensure_deps
   role_guard
   collision_guard
@@ -153,6 +170,12 @@ install_exit(){
   if [[ -f "$CONF" ]]; then
     conf_bak="$CONF.bak.$(date +%s)"
     cp -a "$CONF" "$conf_bak"
+  fi
+
+  # If updating an active EXIT, stop it BEFORE replacing the config.
+  # This makes wg-quick run PostDown from the OLD config and prevents stale NAT/FORWARD rules.
+  if [[ "$wg_was_active" == "active" && -n "$conf_bak" ]]; then
+    systemctl stop "wg-quick@$IF" || die "Không stop được EXIT cũ trước update; giữ nguyên config cũ."
   fi
 
   # Keep the ORIGINAL forwarding state from the first successful install.
@@ -200,9 +223,7 @@ EOF
 
     sysctl -w "net.ipv4.ip_forward=$oldf" >/dev/null 2>&1 || true
 
-    if [[ "$first_install" -eq 0 && -f "$CONF" ]]; then
-      systemctl restart "wg-quick@$IF" >/dev/null 2>&1 || true
-    fi
+    restore_exit_service_state "$wg_was_enabled" "$wg_was_active"
 
     die "Apply EXIT lỗi; đã rollback."
   fi
@@ -229,15 +250,18 @@ EOF
 
     sysctl -w "net.ipv4.ip_forward=$oldf" >/dev/null 2>&1 || true
 
-    if [[ "$first_install" -eq 0 && -f "$CONF" ]]; then
-      systemctl restart "wg-quick@$IF" >/dev/null 2>&1 || true
-    fi
+    restore_exit_service_state "$wg_was_enabled" "$wg_was_active"
 
     die "Default route đổi; đã rollback EXIT."
   fi
 
   [[ -z "$conf_bak" ]] || rm -f "$conf_bak"
   [[ -z "$base_bak" ]] || rm -f "$base_bak"
+
+  systemctl enable "wg-quick@$IF" >/dev/null 2>&1 || die "Không thể enable wg-quick@$IF"
+  systemctl is-active --quiet "wg-quick@$IF" || systemctl start "wg-quick@$IF" >/dev/null 2>&1 || die "Không thể start wg-quick@$IF"
+  systemctl is-enabled --quiet "wg-quick@$IF" || die "wg-quick@$IF chưa enabled sau apply."
+  systemctl is-active --quiet "wg-quick@$IF" || die "wg-quick@$IF chưa active sau apply."
 
   ok "EXIT BASE active"
   echo "EXIT Public Key: $(cat "$STATE/exit.pub")"
@@ -267,6 +291,19 @@ add_main(){
   valid_key "$pub" || die "Key sai"
   valid_ipv4 "$mip" || die "IP sai"
   [[ "$mip" != "$EXIT_IP" ]] || die "IP trùng EXIT"
+
+  # Prevent ambiguous WireGuard peer state: the same public key or tunnel IP
+  # must not be owned by another peer file.
+  local pf other_pub other_ip
+  if compgen -G "$PEERS/*.conf" >/dev/null; then
+    for pf in "$PEERS"/*.conf; do
+      [[ "$pf" == "$PEERS/$n.conf" ]] && continue
+      other_pub=$(awk -F' *= *' '$1=="PublicKey"{print $2}' "$pf" 2>/dev/null || true)
+      other_ip=$(awk -F' *= *' '$1=="AllowedIPs"{sub(/\/32$/, "", $2); print $2}' "$pf" 2>/dev/null || true)
+      [[ "$other_pub" != "$pub" ]] || die "MAIN Public Key đã được peer khác sử dụng: $(basename "$pf" .conf)"
+      [[ "$other_ip" != "$mip" ]] || die "Tunnel IP $mip đã được peer khác sử dụng: $(basename "$pf" .conf)"
+    done
+  fi
 
   f="$PEERS/$n.conf"
   if [[ -f "$f" ]]; then
@@ -311,12 +348,16 @@ EOF
   echo "[CHECK] MAIN peer runtime: $applied_pub"
 
   echo "[CHECK] Chờ WireGuard handshake từ MAIN (tối đa 35 giây)..."
-  local hs=0 i latest
+  local hs=0 i latest now age
   for i in {1..7}; do
     latest=$(wg show "$IF" latest-handshakes 2>/dev/null | awk -v k="$pub" '$1==k {print $2}')
+    now=$(date +%s)
     if [[ "$latest" =~ ^[0-9]+$ ]] && (( latest > 0 )); then
-      hs=1
-      break
+      age=$((now-latest))
+      if (( age >= 0 && age <= 40 )); then
+        hs=1
+        break
+      fi
     fi
     sleep 5
   done
@@ -336,9 +377,13 @@ uninstall_exit(){
  if [[ -s "$BASE_CONF" ]]; then source "$BASE_CONF"; old=${IP_FORWARD_BEFORE:-1}; fi
  systemctl disable --now wg-quick@$IF >/dev/null 2>&1||true
  rm -f "$CONF" "$SYSCTL"
- # Conservative ownership: never force forwarding OFF. Only restore 1 if it was already 1.
- [[ "$old" == 1 ]]&&sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1||true
- rm -rf "$STATE"; ok "Đã gỡ EXIT. Không ép ip_forward về 0."
+ # Do not force forwarding OFF on uninstall: another service may now depend on it.
+ # If it was already ON before YT, keep it ON. If it was OFF, leave the current
+ # runtime value unchanged after removing YT's sysctl file.
+ if [[ "$old" == "1" ]]; then
+   sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+ fi
+ rm -rf "$STATE"; ok "Đã gỡ EXIT; không ép tắt ip_forward để tránh ảnh hưởng dịch vụ khác."
 }
 menu(){ while true; do echo "YT V7 EXIT $VERSION"; echo "1) Cài/Cập nhật EXIT"; echo "2) Thêm MAIN"; echo "3) Trạng thái"; echo "4) Gỡ"; echo "0) Thoát"; read -rp "Chọn: " x; case $x in 1) install_exit;;2)add_main;;3)status;;4)uninstall_exit;;0)exit;;esac; done; }
 case "${1:-menu}" in install)install_exit;;add-main)add_main;;status)status;;uninstall)uninstall_exit;;*)menu;;esac

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-VERSION="7.7.6-base"
+VERSION="7.8.0-rc1"
 BASE="/usr/local/lib/yt-v7"
 SELF="/usr/local/bin/yt7"
 die(){ echo "[ERROR] $*" >&2; exit 1; }

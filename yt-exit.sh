@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-VERSION="7.7.6-base"
-IF=ytwg0; STATE=/etc/yt-v7; ROLE_FILE=$STATE/role; PEERS=$STATE/peers
+VERSION="7.8.0-rc1"
+IF=ytwg0; STATE=/etc/yt-v7; ROLE_FILE=$STATE/role; PEERS=$STATE/peers; TXN_DIR=$STATE/txn-exit
 CONF=/etc/wireguard/$IF.conf; SYSCTL=/etc/sysctl.d/99-yt-v7-forward.conf; BASE_CONF=$STATE/exit-base.env
 die(){ echo "[ERROR] $*" >&2; exit 1; }; ok(){ echo "[OK] $*"; }; warn(){ echo "[WARN] $*"; }
 
@@ -66,6 +66,39 @@ collision_guard(){
   return 0
 }
 load_base(){ [[ -s "$BASE_CONF" ]] || die "EXIT chưa cài"; source "$BASE_CONF"; }
+
+sync_peer_state_from_runtime(){
+  # Only needed when an EXIT is already active. Preserve the working runtime
+  # peer mapping before write_conf rebuilds the persistent config.
+  systemctl is-active --quiet "wg-quick@$IF" || return 0
+
+  local runtime_count state_count=0 pf state_pub state_ip runtime_pub
+  runtime_count=$(wg show "$IF" peers 2>/dev/null | sed '/^[[:space:]]*$/d' | wc -l)
+
+  if compgen -G "$PEERS/*.conf" >/dev/null; then
+    for pf in "$PEERS"/*.conf; do
+      ((++state_count))
+      state_pub=$(awk -F' *= *' '$1=="PublicKey"{print $2; exit}' "$pf" 2>/dev/null || true)
+      state_ip=$(awk -F' *= *' '$1=="AllowedIPs"{sub(/\/32$/, "", $2); print $2; exit}' "$pf" 2>/dev/null || true)
+
+      [[ -n "$state_pub" && -n "$state_ip" ]] || die "Peer state lỗi: $pf"
+
+      runtime_pub=$(wg show "$IF" allowed-ips 2>/dev/null | awk -v ip="${state_ip}/32" '
+        $2==ip {print $1}
+      ')
+
+      [[ -n "$runtime_pub" ]] || die "Peer state/runtime lệch tại $state_ip. Dùng mục Thêm/Cập nhật MAIN trước khi update EXIT."
+
+      if [[ "$runtime_pub" != "$state_pub" ]]; then
+        sed -i "s|^PublicKey *=.*|PublicKey = ${runtime_pub}|" "$pf"
+        echo "[SYNC] Đã đồng bộ peer $(basename "$pf" .conf) theo runtime: $runtime_pub"
+      fi
+    done
+  fi
+
+  [[ "$runtime_count" -eq "$state_count" ]] || die "Số peer runtime ($runtime_count) khác peer state ($state_count). Dừng update để tránh mất peer."
+}
+
 write_conf(){
  load_base; local priv; priv=$(cat "$STATE/exit.key")
  atomic_write "$CONF" 600 <<EOF
@@ -134,8 +167,121 @@ restore_exit_state(){
   sysctl -w "net.ipv4.ip_forward=$oldf_restore" >/dev/null 2>&1 || true
 }
 
+validate_all_peer_ips_in_subnet(){
+  local exit_ip="$1" pf peer_ip prefix
+  prefix="${exit_ip%.*}."
+  if compgen -G "$PEERS/*.conf" >/dev/null; then
+    for pf in "$PEERS"/*.conf; do
+      peer_ip=$(awk -F' *= *' '$1=="AllowedIPs"{sub(/\/32$/, "", $2); print $2; exit}' "$pf" 2>/dev/null || true)
+      valid_ipv4 "$peer_ip" || die "Peer IP không hợp lệ trong $pf"
+      [[ "$peer_ip" == "$prefix"* ]] || die "Peer $(basename "$pf" .conf) dùng $peer_ip ngoài subnet ${prefix}0/24. Hãy sửa/gỡ peer trước khi đổi subnet EXIT."
+      [[ "$peer_ip" != "$exit_ip" ]] || die "Peer $(basename "$pf" .conf) trùng EXIT tunnel IP $exit_ip."
+    done
+  fi
+}
+
+txn_save_file(){
+  local src="$1" tag="$2"
+  if [[ -e "$src" ]]; then
+    printf '1\n' >"$TXN_DIR/${tag}.exists"
+    cp -af "$src" "$TXN_DIR/$tag"
+  else
+    printf '0\n' >"$TXN_DIR/${tag}.exists"
+  fi
+}
+
+txn_restore_file(){
+  local dst="$1" tag="$2" existed="0"
+  [[ -f "$TXN_DIR/${tag}.exists" ]] && existed=$(cat "$TXN_DIR/${tag}.exists")
+  if [[ "$existed" == "1" && -e "$TXN_DIR/$tag" ]]; then
+    cp -af "$TXN_DIR/$tag" "$dst"
+  else
+    rm -f "$dst"
+  fi
+}
+
+begin_exit_transaction(){
+  local was_enabled="$1" was_active="$2" runtime_forward="$3"
+  rm -rf "$TXN_DIR"
+  mkdir -p "$TXN_DIR"
+  chmod 700 "$TXN_DIR"
+  printf '%s\n' "$was_enabled" >"$TXN_DIR/service_enabled"
+  printf '%s\n' "$was_active" >"$TXN_DIR/service_active"
+  printf '%s\n' "$runtime_forward" >"$TXN_DIR/ip_forward_runtime"
+  txn_save_file "$CONF" ytwg0.conf
+  txn_save_file "$BASE_CONF" exit-base.env
+  txn_save_file "$SYSCTL" sysctl.conf
+  txn_save_file "$ROLE_FILE" role
+  if [[ -d "$PEERS" ]]; then
+    printf '1\n' >"$TXN_DIR/peers.exists"
+    cp -a "$PEERS" "$TXN_DIR/peers"
+  else
+    printf '0\n' >"$TXN_DIR/peers.exists"
+  fi
+  sync
+}
+
+install_recovery_service(){
+  local self="/usr/local/lib/yt-v7/yt-exit.sh"
+  [[ -x "$self" ]] || self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+  cat > /etc/systemd/system/yt-v7-recovery.service <<EOF
+[Unit]
+Description=YT V7 EXIT interrupted-update recovery
+DefaultDependencies=no
+After=local-fs.target
+Before=wg-quick@${IF}.service network-online.target
+ConditionPathIsDirectory=${TXN_DIR}
+
+[Service]
+Type=oneshot
+ExecStart=${self} recover-transaction
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  mkdir -p "/etc/systemd/system/wg-quick@${IF}.service.d"
+  cat > "/etc/systemd/system/wg-quick@${IF}.service.d/10-yt-v7-recovery.conf" <<EOF
+[Unit]
+Wants=yt-v7-recovery.service
+After=yt-v7-recovery.service
+EOF
+  systemctl daemon-reload
+  systemctl enable yt-v7-recovery.service >/dev/null 2>&1 || true
+}
+
+commit_exit_transaction(){ rm -rf "$TXN_DIR"; }
+
+recover_exit_transaction(){
+  [[ -d "$TXN_DIR" ]] || return 0
+  echo "[RECOVERY] Phát hiện lần update EXIT trước bị gián đoạn; đang khôi phục trạng thái cũ..."
+
+  local was_enabled="disabled" was_active="inactive" runtime_forward="0"
+  [[ -f "$TXN_DIR/service_enabled" ]] && was_enabled=$(cat "$TXN_DIR/service_enabled")
+  [[ -f "$TXN_DIR/service_active" ]] && was_active=$(cat "$TXN_DIR/service_active")
+  [[ -f "$TXN_DIR/ip_forward_runtime" ]] && runtime_forward=$(cat "$TXN_DIR/ip_forward_runtime")
+
+  systemctl stop "wg-quick@$IF" >/dev/null 2>&1 || true
+  txn_restore_file "$CONF" ytwg0.conf
+  txn_restore_file "$BASE_CONF" exit-base.env
+  txn_restore_file "$SYSCTL" sysctl.conf
+  txn_restore_file "$ROLE_FILE" role
+  local peers_existed="0"
+  [[ -f "$TXN_DIR/peers.exists" ]] && peers_existed=$(cat "$TXN_DIR/peers.exists")
+  rm -rf "$PEERS"
+  if [[ "$peers_existed" == "1" && -d "$TXN_DIR/peers" ]]; then
+    cp -a "$TXN_DIR/peers" "$PEERS"
+  else
+    mkdir -p "$PEERS"
+  fi
+  sysctl -w "net.ipv4.ip_forward=$runtime_forward" >/dev/null 2>&1 || true
+  restore_exit_service_state "$was_enabled" "$was_active"
+  rm -rf "$TXN_DIR"
+  echo "[RECOVERY] Đã khôi phục EXIT về trạng thái trước update."
+}
+
 install_exit(){
   [[ $EUID -eq 0 ]] || die "Chạy root"
+  recover_exit_transaction
   local wg_was_enabled wg_was_active
   wg_was_enabled=$(systemctl is-enabled "wg-quick@$IF" 2>/dev/null || true)
   wg_was_active=$(systemctl is-active "wg-quick@$IF" 2>/dev/null || true)
@@ -144,7 +290,7 @@ install_exit(){
   collision_guard
   command -v python3 >/dev/null || install_missing python3
 
-  local port eip oif before after oldf
+  local port eip oif before after oldf runtime_forward
   local conf_bak="" base_bak="" first_install=0
   [[ -f "$ROLE_FILE" ]] || first_install=1
 
@@ -155,6 +301,7 @@ install_exit(){
 
   valid_port "$port" || die "Port sai"
   valid_ipv4 "$eip" || die "IP sai"
+  validate_all_peer_ips_in_subnet "$eip"
 
   oif=$(ip route show default | awk 'NR==1{for(i=1;i<=NF;i++)if($i=="dev"){print $(i+1);exit}}')
   [[ -n "$oif" ]] || die "Không có OUT IF"
@@ -165,7 +312,16 @@ install_exit(){
   [[ -s "$STATE/exit.key" ]] || (umask 077; wg genkey >"$STATE/exit.key")
   wg pubkey <"$STATE/exit.key" >"$STATE/exit.pub"
 
-  oldf=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo 0)
+  runtime_forward=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo 0)
+  oldf="$runtime_forward"
+
+  install_recovery_service
+
+  # Snapshot persistent state BEFORE peer synchronization or active-tunnel mutation.
+  begin_exit_transaction "$wg_was_enabled" "$wg_was_active" "$runtime_forward"
+
+  # Preserve currently-working runtime peer keys before rebuilding config.
+  sync_peer_state_from_runtime
 
   if [[ -f "$CONF" ]]; then
     conf_bak="$CONF.bak.$(date +%s)"
@@ -221,9 +377,10 @@ EOF
       rm -f "$ROLE_FILE" "$SYSCTL"
     fi
 
-    sysctl -w "net.ipv4.ip_forward=$oldf" >/dev/null 2>&1 || true
+    sysctl -w "net.ipv4.ip_forward=$runtime_forward" >/dev/null 2>&1 || true
 
     restore_exit_service_state "$wg_was_enabled" "$wg_was_active"
+    commit_exit_transaction
 
     die "Apply EXIT lỗi; đã rollback."
   fi
@@ -248,9 +405,10 @@ EOF
       rm -f "$ROLE_FILE" "$SYSCTL"
     fi
 
-    sysctl -w "net.ipv4.ip_forward=$oldf" >/dev/null 2>&1 || true
+    sysctl -w "net.ipv4.ip_forward=$runtime_forward" >/dev/null 2>&1 || true
 
     restore_exit_service_state "$wg_was_enabled" "$wg_was_active"
+    commit_exit_transaction
 
     die "Default route đổi; đã rollback EXIT."
   fi
@@ -263,6 +421,7 @@ EOF
   systemctl is-enabled --quiet "wg-quick@$IF" || die "wg-quick@$IF chưa enabled sau apply."
   systemctl is-active --quiet "wg-quick@$IF" || die "wg-quick@$IF chưa active sau apply."
 
+  commit_exit_transaction
   ok "EXIT BASE active"
   echo "EXIT Public Key: $(cat "$STATE/exit.pub")"
   echo "UDP Port: $port"
@@ -291,6 +450,7 @@ add_main(){
   valid_key "$pub" || die "Key sai"
   valid_ipv4 "$mip" || die "IP sai"
   [[ "$mip" != "$EXIT_IP" ]] || die "IP trùng EXIT"
+  [[ "$mip" == "${EXIT_IP%.*}."* ]] || die "MAIN tunnel IP $mip phải nằm trong subnet ${EXIT_IP%.*}.0/24 của EXIT"
 
   # Prevent ambiguous WireGuard peer state: the same public key or tunnel IP
   # must not be owned by another peer file.
@@ -377,6 +537,9 @@ uninstall_exit(){
  if [[ -s "$BASE_CONF" ]]; then source "$BASE_CONF"; old=${IP_FORWARD_BEFORE:-1}; fi
  systemctl disable --now wg-quick@$IF >/dev/null 2>&1||true
  rm -f "$CONF" "$SYSCTL"
+ rm -f /etc/systemd/system/yt-v7-recovery.service
+ rm -rf "/etc/systemd/system/wg-quick@${IF}.service.d"
+ systemctl daemon-reload >/dev/null 2>&1 || true
  # Do not force forwarding OFF on uninstall: another service may now depend on it.
  # If it was already ON before YT, keep it ON. If it was OFF, leave the current
  # runtime value unchanged after removing YT's sysctl file.
@@ -385,5 +548,15 @@ uninstall_exit(){
  fi
  rm -rf "$STATE"; ok "Đã gỡ EXIT; không ép tắt ip_forward để tránh ảnh hưởng dịch vụ khác."
 }
-menu(){ while true; do echo "YT V7 EXIT $VERSION"; echo "1) Cài/Cập nhật EXIT"; echo "2) Thêm MAIN"; echo "3) Trạng thái"; echo "4) Gỡ"; echo "0) Thoát"; read -rp "Chọn: " x; case $x in 1) install_exit;;2)add_main;;3)status;;4)uninstall_exit;;0)exit;;esac; done; }
-case "${1:-menu}" in install)install_exit;;add-main)add_main;;status)status;;uninstall)uninstall_exit;;*)menu;;esac
+menu(){ while true; do echo "YT V7 EXIT $VERSION"; echo "1) Cài/Cập nhật EXIT"; echo "2) Thêm/Cập nhật MAIN"; echo "3) Trạng thái"; echo "4) Gỡ"; echo "0) Thoát"; read -rp "Chọn: " x; case $x in 1) install_exit;;2)add_main;;3)status;;4)uninstall_exit;;0)exit;;esac; done; }
+case "${1:-menu}" in
+  install) install_exit;;
+  add-main) add_main;;
+  status) status;;
+  uninstall) uninstall_exit;;
+  recover-transaction)
+    [[ $EUID -eq 0 ]] || exit 1
+    recover_exit_transaction
+    ;;
+  *) menu;;
+esac

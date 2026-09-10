@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-VERSION="7.8.0-rc1"
+VERSION="7.8.0-rc2"
 IF=ytwg0; STATE=/etc/yt-v7; ROLE_FILE=$STATE/role; CONF=/etc/wireguard/$IF.conf
 die(){ echo "[ERROR] $*" >&2; exit 1; }; ok(){ echo "[OK] $*"; }; warn(){ echo "[WARN] $*"; }
 
@@ -48,6 +48,47 @@ ipaddress.IPv4Address(sys.argv[1])
 PY
 }
 valid_key(){ [[ "$1" =~ ^[A-Za-z0-9+/]{43}=$ ]]; }
+
+load_existing_main_defaults(){
+  OLD_EIP=""; OLD_EPUB=""; OLD_PORT=""; OLD_MIP=""
+  [[ -f "$CONF" ]] || return 0
+
+  local addr endpoint
+  addr=$(awk -F'=' '/^[[:space:]]*Address[[:space:]]*=/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "$CONF")
+  OLD_MIP="${addr%%/*}"
+
+  OLD_EPUB=$(awk -F'=' '
+    /^\[Peer\]/{peer=1; next}
+    peer && /^[[:space:]]*PublicKey[[:space:]]*=/{sub(/^[^=]*=[[:space:]]*/,""); gsub(/[[:space:]]/,""); print; exit}
+  ' "$CONF")
+
+  endpoint=$(awk '
+    /^\[Peer\]/{peer=1; next}
+    peer && /^[[:space:]]*Endpoint[[:space:]]*=/{sub(/^[^=]*=[[:space:]]*/,""); gsub(/[[:space:]]/,""); print; exit}
+  ' "$CONF")
+
+  # V7 MAIN currently supports IPv4 EXIT endpoints. Split only the final :port.
+  if [[ "$endpoint" =~ ^([0-9]{1,3}(\.[0-9]{1,3}){3}):([0-9]+)$ ]]; then
+    OLD_EIP="${BASH_REMATCH[1]}"
+    OLD_PORT="${BASH_REMATCH[3]}"
+  fi
+
+  valid_ipv4 "${OLD_EIP:-}" || OLD_EIP=""
+  valid_ipv4 "${OLD_MIP:-}" || OLD_MIP=""
+  valid_port "${OLD_PORT:-}" || OLD_PORT=""
+  valid_key "${OLD_EPUB:-}" || OLD_EPUB=""
+}
+
+prompt_with_default(){
+  local __var="$1" label="$2" def="${3:-}" value
+  if [[ -n "$def" ]]; then
+    read -rp "$label [$def]: " value
+    value=${value:-$def}
+  else
+    read -rp "$label: " value
+  fi
+  printf -v "$__var" '%s' "$value"
+}
 default_route(){ ip -4 route show default | head -1; }
 role_guard(){
   local r
@@ -94,13 +135,22 @@ install_main(){
   ensure_deps; role_guard; collision_guard
   command -v python3 >/dev/null || install_missing python3
   local eip epub port mip before after priv bak="" first_install=0
+  local OLD_EIP="" OLD_EPUB="" OLD_PORT="" OLD_MIP=""
   [[ -f "$ROLE_FILE" ]] || first_install=1
-  read -rp "EXIT Public IP: " eip
-  read -rp "EXIT Public Key: " epub
+
+  load_existing_main_defaults
+
+  if [[ "$first_install" -eq 0 && -n "$OLD_EIP" && -n "$OLD_EPUB" && -n "$OLD_PORT" && -n "$OLD_MIP" ]]; then
+    echo "[INFO] Đã đọc cấu hình MAIN hiện tại. Nhấn Enter để giữ nguyên."
+  fi
+
+  prompt_with_default eip  "EXIT Public IP"  "$OLD_EIP"
+  prompt_with_default epub "EXIT Public Key" "$OLD_EPUB"
   epub=$(printf '%s' "$epub" | tr -d '[:space:]')
   echo "[CHECK] EXIT Public Key: $epub"
-  read -rp "EXIT Port [44443]: " port; port=${port:-44443}
-  read -rp "MAIN tunnel IP [10.88.0.2]: " mip; mip=${mip:-10.88.0.2}
+  prompt_with_default port "EXIT Port" "${OLD_PORT:-44443}"
+  prompt_with_default mip  "MAIN tunnel IP" "${OLD_MIP:-10.88.0.2}"
+
   valid_ipv4 "$eip" || die "EXIT IP sai"; valid_ipv4 "$mip" || die "MAIN IP sai"
   valid_port "$port" || die "Port sai"; valid_key "$epub" || die "Public Key sai"
   mkdir -p "$STATE" /etc/wireguard; chmod 700 "$STATE" /etc/wireguard

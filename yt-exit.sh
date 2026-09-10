@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-VERSION="7.8.0-rc1"
+VERSION="7.8.0-rc2"
 IF=ytwg0; STATE=/etc/yt-v7; ROLE_FILE=$STATE/role; PEERS=$STATE/peers; TXN_DIR=$STATE/txn-exit
 CONF=/etc/wireguard/$IF.conf; SYSCTL=/etc/sysctl.d/99-yt-v7-forward.conf; BASE_CONF=$STATE/exit-base.env
 die(){ echo "[ERROR] $*" >&2; exit 1; }; ok(){ echo "[OK] $*"; }; warn(){ echo "[WARN] $*"; }

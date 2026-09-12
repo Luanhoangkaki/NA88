@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-V=2.1.14; IF=ytwg0; DIR=/etc/wireguard; CONF=$DIR/$IF.conf; SD=/etc/yt7-unified
+V=2.1.17; IF=ytwg0; DIR=/etc/wireguard; CONF=$DIR/$IF.conf; SD=/etc/yt7-unified
 
 state_preflight(){
   local role="$1"
   case "$role" in
     EXIT)
-      [ ! -e "$SD/exit" ] || die "State cũ tồn tại: $SD/exit. Hãy kiểm tra/gỡ thủ công trước khi setup EXIT mới."
-      [ ! -e "$SD/main" ] || die "VPS này đã có MAIN state: $SD/main. Không setup EXIT chồng lên cùng VPS."
+      [ ! -e "$SD/exit" ] && [ ! -L "$SD/exit" ] || die "State cũ tồn tại: $SD/exit. Hãy kiểm tra/gỡ thủ công trước khi setup EXIT mới."
+      [ ! -e "$SD/main" ] && [ ! -L "$SD/main" ] || die "VPS này đã có MAIN state: $SD/main. Không setup EXIT chồng lên cùng VPS."
       ;;
     MAIN)
-      [ ! -e "$SD/main" ] || die "State cũ tồn tại: $SD/main. Hãy kiểm tra/gỡ thủ công trước khi setup MAIN mới."
-      [ ! -e "$SD/exit" ] || die "VPS này đã có EXIT state: $SD/exit. Không setup MAIN chồng lên cùng VPS."
+      [ ! -e "$SD/main" ] && [ ! -L "$SD/main" ] || die "State cũ tồn tại: $SD/main. Hãy kiểm tra/gỡ thủ công trước khi setup MAIN mới."
+      [ ! -e "$SD/exit" ] && [ ! -L "$SD/exit" ] || die "VPS này đã có EXIT state: $SD/exit. Không setup MAIN chồng lên cùng VPS."
       ;;
     *)
       die "state_preflight role không hợp lệ: $role"
@@ -250,6 +250,64 @@ postcheck_exit(){
   iptables-save 2>/dev/null | grep -q 'YT7_EXIT_FWD_IN' || die "Post-check EXIT: thiếu FORWARD return rule YT7."
 }
 
+policy_rule_present(){
+  local main_ip=$1
+  ip -4 rule show 2>/dev/null | awk -v p="${PRIO}:" -v src="$main_ip" -v t="$TABLE" '
+    $1==p {
+      have_src=0; have_table=0
+      for(i=2;i<=NF;i++){
+        if($i=="from" && ( $(i+1)==src || $(i+1)==src "/32" )) have_src=1
+        if(($i=="lookup" || $i=="table") && $(i+1)==t) have_table=1
+      }
+      if(have_src && have_table) found=1
+    }
+    END{exit found?0:1}
+  '
+}
+
+policy_routes_present(){
+  local main_ip=$1
+  ip -4 route show table "$TABLE" 2>/dev/null | awk -v dev="$IF" -v src="$main_ip" ' 
+    $1=="default" {
+      this_dev=0; this_src=0
+      for(i=2;i<=NF;i++){
+        if($i=="dev" && $(i+1)==dev) this_dev=1
+        if($i=="src" && $(i+1)==src) this_src=1
+      }
+      if(this_dev && this_src) d=1
+    }
+    $1=="10.88.0.0/24" {
+      this_dev=0; this_src=0
+      for(i=2;i<=NF;i++){
+        if($i=="dev" && $(i+1)==dev) this_dev=1
+        if($i=="src" && $(i+1)==src) this_src=1
+      }
+      if(this_dev && this_src) n=1
+    }
+    END{exit (d && n)?0:1}
+  '
+}
+
+policy_lookup_present(){
+  local main_ip=$1
+  ip -4 route get 1.1.1.1 from "$main_ip" 2>/dev/null \
+    | grep -Eq "dev[[:space:]]+$IF([[:space:]]|$)"
+}
+
+wait_policy_ready(){
+  local main_ip=$1 tries=30
+  while ((tries--)); do
+    if systemctl is-active --quiet yt7-main-policy.service \
+       && policy_rule_present "$main_ip" \
+       && policy_routes_present "$main_ip" \
+       && policy_lookup_present "$main_ip"; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  return 1
+}
+
 postcheck_main(){
   local main_ip=$1 expected_default=$2 expected_pid=$3 expected_sha=$4 expected_bin_sha=$5 expected_bin_path=$6 current_bin_path
   [ -n "$expected_sha" ] || die "Post-check MAIN: SHA config ban đầu rỗng."
@@ -257,20 +315,27 @@ postcheck_main(){
   [ -n "$expected_bin_path" ] || die "Post-check MAIN: đường dẫn binary ban đầu rỗng."
   systemctl is-active --quiet v2node || die "Post-check MAIN: V2Node không active."
   systemctl is-active --quiet "wg-quick@$IF" || die "Post-check MAIN: wg-quick@$IF không active."
-  systemctl is-active --quiet yt7-main-policy.service || die "Post-check MAIN: policy service không active."
+  if ! wait_policy_ready "$main_ip"; then
+    echo "[DEBUG] ip rule:" >&2
+    ip -4 rule show >&2 || true
+    echo "[DEBUG] table $TABLE:" >&2
+    ip -4 route show table "$TABLE" >&2 || true
+    echo "[DEBUG] route lookup source $main_ip:" >&2
+    ip -4 route get 1.1.1.1 from "$main_ip" >&2 || true
+    echo "[DEBUG] yt7-main-policy.service:" >&2
+    systemctl status yt7-main-policy.service --no-pager -l >&2 || true
+    die "Post-check MAIN: policy rule/route chưa sẵn sàng sau thời gian chờ."
+  fi
   ip -4 addr show dev "$IF" | grep -Eq "inet[[:space:]]+${main_ip//./\\.}/24([[:space:]]|$)" || die "Post-check MAIN: tunnel IP runtime sai."
   [ "$(cat /sys/class/net/$IF/mtu 2>/dev/null)" = "1420" ] || die "Post-check MAIN: MTU runtime không phải 1420."
-  ip -4 rule show | grep -Eq "^${PRIO}:[[:space:]]+from ${main_ip//./\\.} lookup ${TABLE}([[:space:]]|$)" || die "Post-check MAIN: thiếu policy rule."
-  ip -4 route show table "$TABLE" | grep -Eq "^default dev $IF scope link src ${main_ip//./\\.}$" || die "Post-check MAIN: default table $TABLE sai."
-  ip -4 route show table "$TABLE" | grep -Eq "^10\.88\.0\.0/24 dev $IF scope link src ${main_ip//./\\.}$" || die "Post-check MAIN: subnet route table $TABLE sai."
   [ "$(defroute)" = "$expected_default" ] || die "Post-check MAIN: default route hệ thống thay đổi."
   [ "$(systemctl show v2node -p MainPID --value 2>/dev/null||echo 0)" = "$expected_pid" ] || die "Post-check MAIN: V2Node PID thay đổi."
   [ "$(sha256sum /etc/v2node/config.json 2>/dev/null|awk '{print $1}'||true)" = "$expected_sha" ] || die "Post-check MAIN: /etc/v2node/config.json thay đổi."
   current_bin_path=$(readlink -f "/proc/$expected_pid/exe" 2>/dev/null || true)
   [ "$current_bin_path" = "$expected_bin_path" ] || die "Post-check MAIN: executable V2Node đang chạy thay đổi."
   [ "$(sha256sum "$expected_bin_path" 2>/dev/null|awk '{print $1}'||true)" = "$expected_bin_sha" ] || die "Post-check MAIN: binary V2Node thay đổi."
-  ip -4 route get 1.1.1.1 | grep -q "dev $IF" && die "Post-check MAIN: traffic thường bị đưa vào tunnel."
-  ip -4 route get 1.1.1.1 from "$main_ip" | grep -q "dev $IF" || die "Post-check MAIN: source $main_ip chưa đi tunnel."
+  ip -4 route get 1.1.1.1 2>/dev/null | grep -Eq "dev[[:space:]]+$IF([[:space:]]|$)" && die "Post-check MAIN: traffic thường bị đưa vào tunnel."
+  policy_lookup_present "$main_ip" || die "Post-check MAIN: source $main_ip chưa đi tunnel."
 }
 defroute(){ ip -4 route show default|head -1; }
 wan(){ ip -4 route show default|awk 'NR==1{for(i=1;i<=NF;i++)if($i=="dev"){print $(i+1);exit}}'; }
@@ -310,9 +375,9 @@ keys(){
 setup_exit(){
  root; need_cmds
  state_preflight EXIT
- [ ! -e "$CONF" ] || die "$CONF đã tồn tại; không ghi đè."
+ [ ! -e "$CONF" ] && [ ! -L "$CONF" ] || die "$CONF đã tồn tại; không ghi đè."
  subnet_conflict "10.88.0.0/24" && die "Phát hiện route 10.88.0.0/24 đang dùng bởi interface khác."
- [ ! -e /etc/sysctl.d/99-yt7-forward.conf ] || die "/etc/sysctl.d/99-yt7-forward.conf đã tồn tại; không ghi đè."
+ [ ! -e /etc/sysctl.d/99-yt7-forward.conf ] && [ ! -L /etc/sysctl.d/99-yt7-forward.conf ] || die "/etc/sysctl.d/99-yt7-forward.conf đã tồn tại; không ghi đè."
  wg_name_preflight
  local W P B PRIV PUB
  W=$(wan); P=${1:-}; B=$(defroute); [ -n "$W" ] || die "Không thấy WAN"
@@ -321,6 +386,10 @@ setup_exit(){
    P=${P:-$PORT}
  fi
  [[ "$P" =~ ^[0-9]+$ ]] && [ "$P" -ge 1 ] && [ "$P" -le 65535 ] || die "UDP port không hợp lệ."
+ if command -v ss >/dev/null 2>&1; then
+   ss -H -lun 2>/dev/null | awk -v p=":$P" '$4 ~ (p "$") {found=1} END{exit found?0:1}' \
+     && die "UDP port $P đang được tiến trình khác lắng nghe; chọn port khác."
+ fi
 
  # Chỉ sau preflight read-only mới cài dependency nếu máy còn thiếu.
  deps
@@ -361,16 +430,17 @@ EOF
  [ "$(defroute)" = "$B" ] || die "Default route EXIT thay đổi."
  created_exit_state=1
  mkdir -p "$SD"; chmod 700 "$SD"; printf "ROLE=EXIT\nWAN=%s\nPORT=%s\n" "$W" "$P">"$SD/exit"
+ chmod 600 "$SD/exit"
  postcheck_exit "$P" "$B"
  commit_txn; ok "EXIT sẵn sàng"; echo "EXIT_WG_PUBLIC_KEY=$PUB"; echo "EXIT_PORT=$P"; echo "EXIT_TUNNEL_IP=10.88.0.1"
 }
 setup_main(){
  root; need_cmds
  state_preflight MAIN
- [ ! -e "$CONF" ] || die "$CONF đã tồn tại; không ghi đè."
+ [ ! -e "$CONF" ] && [ ! -L "$CONF" ] || die "$CONF đã tồn tại; không ghi đè."
  subnet_conflict "10.88.0.0/24" && die "Phát hiện route 10.88.0.0/24 đang dùng bởi interface khác."
- [ ! -e /usr/local/sbin/yt7-main-policy.sh ] || die "Policy script đã tồn tại; không ghi đè."
- [ ! -e /etc/systemd/system/yt7-main-policy.service ] || die "Policy service đã tồn tại; không ghi đè."
+ [ ! -e /usr/local/sbin/yt7-main-policy.sh ] && [ ! -L /usr/local/sbin/yt7-main-policy.sh ] || die "Policy script đã tồn tại; không ghi đè."
+ [ ! -e /etc/systemd/system/yt7-main-policy.service ] && [ ! -L /etc/systemd/system/yt7-main-policy.service ] || die "Policy service đã tồn tại; không ghi đè."
  wg_name_preflight
  local E K M P B PRIV PUB PID SHA BIN_SHA BIN_PATH
  E=${1:-}; K=${2:-}; M=${3:-}; P=${4:-}
@@ -459,6 +529,7 @@ EOF
  created_policy_service=1
  cat >/etc/systemd/system/yt7-main-policy.service <<EOF
 [Unit]
+Requires=wg-quick@$IF.service
 After=wg-quick@$IF.service
 BindsTo=wg-quick@$IF.service
 PartOf=wg-quick@$IF.service
@@ -476,7 +547,8 @@ EOF
  [ "$(systemctl show v2node -p MainPID --value 2>/dev/null||echo 0)" = "$PID" ]||die "V2Node PID thay đổi"
  [ "$(sha256sum /etc/v2node/config.json 2>/dev/null|awk '{print $1}'||true)" = "$SHA" ]||die "V2Node config thay đổi"
  created_main_state=1
- mkdir -p "$SD"; printf "ROLE=MAIN\nMAIN_IP=%s\nEXIT_IP=%s\n" "$M" "$E">"$SD/main"
+ mkdir -p "$SD"; chmod 700 "$SD"; printf "ROLE=MAIN\nMAIN_IP=%s\nEXIT_IP=%s\nEXIT_PORT=%s\n" "$M" "$E" "$P">"$SD/main"
+ chmod 600 "$SD/main"
  postcheck_main "$M" "$B" "$PID" "$SHA" "$BIN_SHA" "$BIN_PATH"
  commit_txn
  ok "MAIN đã tạo tunnel + policy an toàn; cần add-peer trên EXIT rồi chạy test-main."

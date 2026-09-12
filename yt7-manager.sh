@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-V=2.1.13; IF=ytwg0; DIR=/etc/wireguard; CONF=$DIR/$IF.conf; SD=/etc/yt7-unified
+V=2.1.14; IF=ytwg0; DIR=/etc/wireguard; CONF=$DIR/$IF.conf; SD=/etc/yt7-unified
 
 state_preflight(){
   local role="$1"
@@ -315,7 +315,11 @@ setup_exit(){
  [ ! -e /etc/sysctl.d/99-yt7-forward.conf ] || die "/etc/sysctl.d/99-yt7-forward.conf đã tồn tại; không ghi đè."
  wg_name_preflight
  local W P B PRIV PUB
- W=$(wan); P=${1:-$PORT}; B=$(defroute); [ -n "$W" ] || die "Không thấy WAN"
+ W=$(wan); P=${1:-}; B=$(defroute); [ -n "$W" ] || die "Không thấy WAN"
+ if [ -z "$P" ]; then
+   read -rp "UDP WireGuard Port [$PORT]: " P
+   P=${P:-$PORT}
+ fi
  [[ "$P" =~ ^[0-9]+$ ]] && [ "$P" -ge 1 ] && [ "$P" -le 65535 ] || die "UDP port không hợp lệ."
 
  # Chỉ sau preflight read-only mới cài dependency nếu máy còn thiếu.
@@ -369,10 +373,15 @@ setup_main(){
  [ ! -e /etc/systemd/system/yt7-main-policy.service ] || die "Policy service đã tồn tại; không ghi đè."
  wg_name_preflight
  local E K M P B PRIV PUB PID SHA BIN_SHA BIN_PATH
- E=${1:-}; K=${2:-}; M=${3:-}; P=${4:-$PORT}
+ E=${1:-}; K=${2:-}; M=${3:-}; P=${4:-}
  [ -n "$E" ]||read -rp "Public IP EXIT: " E
  [ -n "$K" ]||read -rp "WG Public Key EXIT: " K
- [ -n "$M" ]||read -rp "Tunnel IP MAIN (10.88.0.2..254): " M
+ if [ -z "$P" ]; then
+   read -rp "UDP Port EXIT [$PORT]: " P
+   P=${P:-$PORT}
+ fi
+ [ -n "$M" ]||read -rp "Tunnel IP MAIN [10.88.0.2] (10.88.0.2..254): " M
+ M=${M:-10.88.0.2}
  validip "$E" >/dev/null || die "EXIT IP sai"
  valid_main_tunnel_ip "$M" || die "Tunnel IP MAIN phải nằm trong 10.88.0.2..10.88.0.254"
  ip rule show|grep -q "^$PRIO:" && die "Priority $PRIO đang dùng"
@@ -681,7 +690,7 @@ menu(){
 }
 root
 case ${1:-menu} in
- setup-exit) setup_exit "${2:-$PORT}";; setup-main) setup_main "${2:-}" "${3:-}" "${4:-}" "${5:-$PORT}";;
+ setup-exit) setup_exit "${2:-}";; setup-main) setup_main "${2:-}" "${3:-}" "${4:-}" "${5:-}";;
  add-peer) add_peer "${2:-}" "${3:-}";; test-main)test_main;; panel)panel "${2:-}";; status)status;; menu)menu;;
  *) die "Dùng: menu|setup-exit|setup-main|add-peer|test-main|panel|status";;
 esac

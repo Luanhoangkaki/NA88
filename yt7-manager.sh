@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-V=2.1.22; IF=ytwg0; DIR=/etc/wireguard; CONF=$DIR/$IF.conf; SD=/etc/yt7-unified
+V=2.1.23; IF=ytwg0; DIR=/etc/wireguard; CONF=$DIR/$IF.conf; SD=/etc/yt7-unified
 
 state_preflight(){
   local role="$1"
@@ -23,7 +23,7 @@ ok(){ echo "[OK] $*"; }; warn(){ echo "[WARN] $*" >&2; }; die(){ echo "[ERROR] $
 root(){ [ "$(id -u)" = 0 ] || die "Chạy bằng root"; }
 need_cmds(){
   local c
-  for c in id ip awk grep sed cut tr head cat cp mv rm mktemp sha256sum systemctl chmod chown stat mkdir rmdir sleep readlink; do
+  for c in id ip awk grep sed cut tr head cat cp mv rm mktemp sha256sum systemctl chmod chown stat mkdir rmdir sleep readlink tee; do
     command -v "$c" >/dev/null 2>&1 || die "Thiếu lệnh bắt buộc: $c"
   done
 }
@@ -366,10 +366,62 @@ validip(){
   done
 }
 deps(){
- if ! command -v wg >/dev/null || ! command -v iptables >/dev/null; then
-   command -v apt-get >/dev/null || die "Chỉ hỗ trợ Debian/Ubuntu apt"
-   apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y wireguard-tools iptables
- fi
+  # Cài đúng dependency còn thiếu. MAIN không cần iptables; EXIT mới cần.
+  # Không chạy apt-get update mặc định để tránh làm mỗi lần setup bị chậm.
+  local role="${1:-MAIN}" log rc=0
+  local -a pkgs=()
+
+  if ! command -v wg >/dev/null 2>&1 || ! command -v wg-quick >/dev/null 2>&1; then
+    pkgs+=(wireguard-tools)
+  fi
+  if [ "$role" = "EXIT" ] && ! command -v iptables >/dev/null 2>&1; then
+    pkgs+=(iptables)
+  fi
+
+  # Đã đủ dependency -> tuyệt đối không gọi APT.
+  [ "${#pkgs[@]}" -gt 0 ] || return 0
+
+  command -v apt-get >/dev/null 2>&1 || die "Thiếu ${pkgs[*]} và máy không có apt-get (chỉ hỗ trợ Debian/Ubuntu apt)."
+
+  echo "[INFO] Chỉ cài dependency còn thiếu: ${pkgs[*]}"
+  echo "[INFO] Nếu APT đang bận, chỉ chờ tối đa 60 giây; không chờ vô hạn."
+  log=$(mktemp /tmp/yt7-apt.XXXXXX)
+
+  set +e
+  DEBIAN_FRONTEND=noninteractive apt-get \
+    -o DPkg::Lock::Timeout=60 \
+    install -y --no-install-recommends "${pkgs[@]}" 2>&1 | tee "$log"
+  rc=${PIPESTATUS[0]}
+  set -e
+
+  if [ "$rc" -ne 0 ]; then
+    # Chỉ update package index khi lỗi thực sự do index/package chưa có.
+    if grep -Eqi 'Unable to locate package|has no installation candidate|Package .* is not available' "$log"; then
+      warn "Package index chưa đủ; chạy apt-get update một lần rồi thử lại."
+      set +e
+      apt-get -o DPkg::Lock::Timeout=60 update 2>&1 | tee "$log"
+      rc=${PIPESTATUS[0]}
+      set -e
+      [ "$rc" -eq 0 ] || { rm -f "$log"; die "apt-get update thất bại; không thay đổi cấu hình mạng/V2Node."; }
+
+      set +e
+      DEBIAN_FRONTEND=noninteractive apt-get \
+        -o DPkg::Lock::Timeout=60 \
+        install -y --no-install-recommends "${pkgs[@]}" 2>&1 | tee "$log"
+      rc=${PIPESTATUS[0]}
+      set -e
+    fi
+  fi
+
+  if [ "$rc" -ne 0 ]; then
+    if grep -Eqi 'Could not get lock|Unable to acquire the dpkg frontend lock|dpkg frontend lock' "$log"; then
+      rm -f "$log"
+      die "APT vẫn đang bị tiến trình hệ thống giữ lock sau 60 giây. YT7 dừng an toàn; không sửa route, WireGuard hay V2Node. Chạy lại 'yt' sau khi APT rảnh."
+    fi
+    rm -f "$log"
+    die "Không cài được dependency: ${pkgs[*]}. YT7 dừng trước khi thay đổi mạng/V2Node."
+  fi
+  rm -f "$log"
 }
 keys(){
   if [ ! -d "$DIR" ]; then
@@ -409,7 +461,7 @@ setup_exit(){
  fi
 
  # Chỉ sau preflight read-only mới cài dependency nếu máy còn thiếu.
- deps
+ deps EXIT
  need_wg_cmds
  need_exit_cmds
 
@@ -490,7 +542,7 @@ setup_main(){
  [ -n "$SHA" ] || die "Không đọc được SHA256 config V2Node."
 
  # Chỉ sau preflight read-only mới cài dependency nếu máy còn thiếu.
- deps
+ deps MAIN
  need_wg_cmds
 
  TX_MAIN_IP="$M"

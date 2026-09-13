@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-V=2.1.17; IF=ytwg0; DIR=/etc/wireguard; CONF=$DIR/$IF.conf; SD=/etc/yt7-unified
+V=2.1.22; IF=ytwg0; DIR=/etc/wireguard; CONF=$DIR/$IF.conf; SD=/etc/yt7-unified
 
 state_preflight(){
   local role="$1"
@@ -19,7 +19,7 @@ state_preflight(){
   esac
 }
 TABLE=1788; PRIO=17880; PORT=44443
-ok(){ echo "[OK] $*"; }; die(){ echo "[ERROR] $*" >&2; exit 1; }
+ok(){ echo "[OK] $*"; }; warn(){ echo "[WARN] $*" >&2; }; die(){ echo "[ERROR] $*" >&2; exit 1; }
 root(){ [ "$(id -u)" = 0 ] || die "Chạy bằng root"; }
 need_cmds(){
   local c
@@ -180,26 +180,36 @@ cidr_overlap(){
   (( net1 <= end2 && net2 <= end1 ))
 }
 subnet_conflict(){
-  local target="$1" ifname="${2:-$IF}" line token cidr
+  local target="$1" ifname="${2:-$IF}" line dest cidr
   while IFS= read -r line; do
     [[ "$line" =~ (^|[[:space:]])dev[[:space:]]+$ifname([[:space:]]|$) ]] && continue
-    for token in $line; do
-      cidr=""
-      if [[ "$token" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]]; then
-        cidr="$token"
-      elif [[ "$token" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-        # Host route without an explicit prefix.
-        cidr="$token/32"
-      fi
-      [ -n "$cidr" ] || continue
-      if cidr_overlap "$target" "$cidr"; then
-        echo "[CONFLICT] $target overlaps existing route/address: $line" >&2
-        return 0
-      fi
-      # Only the destination field matters. Avoid treating gateway/src IPs
-      # later in the route line as destination networks.
-      break
-    done
+
+    # Chỉ kiểm tra DESTINATION của route. Không được hiểu nhầm gateway/src
+    # ở các field phía sau thành một mạng đích.
+    read -r -a fields <<<"$line"
+    [ "${#fields[@]}" -gt 0 ] || continue
+    case "${fields[0]}" in
+      local|broadcast|unreachable|prohibit|blackhole|throw)
+        dest="${fields[1]:-}"
+        ;;
+      *)
+        dest="${fields[0]}"
+        ;;
+    esac
+    [ -n "$dest" ] || continue
+    [ "$dest" != "default" ] || continue
+
+    cidr=""
+    if [[ "$dest" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]]; then
+      cidr="$dest"
+    elif [[ "$dest" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+      cidr="$dest/32"
+    fi
+    [ -n "$cidr" ] || continue
+    if cidr_overlap "$target" "$cidr"; then
+      echo "[CONFLICT] $target overlaps existing route/address: $line" >&2
+      return 0
+    fi
   done < <(ip -4 route show table all 2>/dev/null)
 
   # Also inspect assigned addresses, including cases that do not currently
@@ -245,9 +255,16 @@ postcheck_exit(){
   wg show "$IF" listen-port 2>/dev/null | grep -qx "$expected_port" || die "Post-check EXIT: ListenPort runtime sai."
   [ "$(defroute)" = "$expected_default" ] || die "Post-check EXIT: default route thay đổi."
   sysctl -n net.ipv4.ip_forward 2>/dev/null | grep -qx '1' || die "Post-check EXIT: ip_forward chưa bật."
-  iptables-save 2>/dev/null | grep -q 'YT7_EXIT_MASQ' || die "Post-check EXIT: thiếu NAT rule YT7."
-  iptables-save 2>/dev/null | grep -q 'YT7_EXIT_FWD_OUT' || die "Post-check EXIT: thiếu FORWARD out rule YT7."
-  iptables-save 2>/dev/null | grep -q 'YT7_EXIT_FWD_IN' || die "Post-check EXIT: thiếu FORWARD return rule YT7."
+  # Xác minh đúng rule, đúng chain/interface; không chỉ tìm comment chung chung.
+  local w
+  w=$(wan)
+  [ -n "$w" ] || die "Post-check EXIT: không xác định được WAN interface."
+  iptables -t nat -C POSTROUTING -s 10.88.0.0/24 -o "$w" -m comment --comment YT7_EXIT_MASQ -j MASQUERADE >/dev/null 2>&1 \
+    || die "Post-check EXIT: thiếu NAT rule YT7 chính xác."
+  iptables -C FORWARD -i "$IF" -o "$w" -m comment --comment YT7_EXIT_FWD_OUT -j ACCEPT >/dev/null 2>&1 \
+    || die "Post-check EXIT: thiếu FORWARD out rule YT7 chính xác."
+  iptables -C FORWARD -i "$w" -o "$IF" -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment YT7_EXIT_FWD_IN -j ACCEPT >/dev/null 2>&1 \
+    || die "Post-check EXIT: thiếu FORWARD return rule YT7 chính xác."
 }
 
 policy_rule_present(){
@@ -507,14 +524,52 @@ IF="$IF"
 IP="$M"
 
 has_rule(){
-  ip -4 rule show | grep -Fq "\${RULE}:	from \${SRC%/*} lookup \${TABLE}" ||
-  ip -4 rule show | grep -Eq "^\${RULE}:[[:space:]]+from \${SRC%/*} lookup \${TABLE}([[:space:]]|$)"
+  # Parse theo field thay vì phụ thuộc format iproute2 (lookup/table, IP hoặc IP/32).
+  ip -4 rule show | awk -v pref="\$RULE" -v src="\${SRC%/*}" -v tbl="\$TABLE" '
+    \$1 == pref ":" {
+      got_src=0; got_tbl=0
+      for (i=2; i<=NF; i++) {
+        if (\$i=="from") {
+          v=\$(i+1); sub(/\/32\$/, "", v)
+          if (v==src) got_src=1
+        }
+        if ((\$i=="lookup" || \$i=="table") && \$(i+1)==tbl) got_tbl=1
+      }
+      if (got_src && got_tbl) found=1
+    }
+    END { exit found ? 0 : 1 }
+  '
+}
+pref_in_use(){
+  ip -4 rule show | awk -v pref="\$RULE:" '\$1==pref {found=1} END{exit found?0:1}'
 }
 case "\${1:-apply}" in
 apply)
-  has_rule || ip -4 rule add pref "\$RULE" from "\$SRC" lookup "\$TABLE"
-  ip -4 route replace table "\$TABLE" "\$NET" dev "\$IF" src "\$IP"
-  ip -4 route replace table "\$TABLE" default dev "\$IF" src "\$IP"
+  # Không tạo policy khi tunnel chưa tồn tại.
+  ip link show dev "\$IF" >/dev/null 2>&1 || {
+    echo "[ERROR] Interface \$IF chưa tồn tại; bỏ qua policy apply." >&2
+    exit 1
+  }
+  rule_exists=0
+  if has_rule; then
+    rule_exists=1
+  elif pref_in_use; then
+    echo "[ERROR] Policy priority \$RULE đang bị rule khác sử dụng; không tạo rule trùng priority." >&2
+    exit 1
+  fi
+  # Tạo/khôi phục route trước, chỉ thêm rule sau cùng. Như vậy nếu route lỗi
+  # ở lần cài đầu, traffic chưa thể bị đưa vào một policy table chưa hoàn chỉnh.
+  ip -4 route replace table "\$TABLE" "\$NET" dev "\$IF" src "\$IP" || {
+    echo "[ERROR] Không apply được route tunnel trong policy table." >&2
+    exit 1
+  }
+  ip -4 route replace table "\$TABLE" default dev "\$IF" src "\$IP" || {
+    echo "[ERROR] Không apply được default route trong policy table." >&2
+    exit 1
+  }
+  if [ "\$rule_exists" = 0 ]; then
+    ip -4 rule add pref "\$RULE" from "\$SRC" lookup "\$TABLE"
+  fi
   ;;
 remove)
   ip -4 rule del pref "\$RULE" from "\$SRC" lookup "\$TABLE" 2>/dev/null || true
@@ -551,9 +606,10 @@ EOF
  chmod 600 "$SD/main"
  postcheck_main "$M" "$B" "$PID" "$SHA" "$BIN_SHA" "$BIN_PATH"
  commit_txn
+ if ! ensure_main_policy_guard; then warn "Không cài được policy guard; MAIN vẫn giữ policy chính."; fi
  ok "MAIN đã tạo tunnel + policy an toàn; cần add-peer trên EXIT rồi chạy test-main."
  echo "MAIN_WG_PUBLIC_KEY=$PUB"; echo "MAIN_TUNNEL_IP=$M"
- echo "SANG EXIT CHẠY: $0 add-peer '$PUB' '$M'"
+ echo "SANG EXIT CHẠY: yt add-peer '$PUB' '$M'"
  echo "PANEL JSON: {\"tag\":\"yt_exit\",\"sendThrough\":\"$M\",\"protocol\":\"freedom\",\"settings\":{\"domainStrategy\":\"UseIPv4\"}}"
 }
 add_peer(){
@@ -755,12 +811,74 @@ XRAY:
 EOF
 }
 status(){ root; need_cmds; need_wg_cmds; echo "Default: $(defroute)"; systemctl is-active wg-quick@$IF 2>/dev/null||true; wg show $IF 2>/dev/null||true; ip rule show|grep "^$PRIO:"||true; ip route show table $TABLE 2>/dev/null||true; }
+install_launcher(){
+  local self tmp
+  self=$(readlink -f "$0" 2>/dev/null || true)
+  [ -n "$self" ] && [ -f "$self" ] || return 0
+  for c in cp mv chmod ln mkdir grep; do command -v "$c" >/dev/null 2>&1 || return 1; done
+
+  # Nếu chạy kiểu "curl ... | bash", $0 có thể trỏ tới chính binary bash.
+  # Tuyệt đối không copy nhầm /bin/bash thành yt7-manager.
+  grep -Fq 'IF=ytwg0; DIR=/etc/wireguard' "$self" 2>/dev/null || return 1
+  grep -Fq 'setup_main(){' "$self" 2>/dev/null || return 1
+
+  mkdir -p /usr/local/sbin /usr/local/bin
+  if [ "$self" != "/usr/local/sbin/yt7-manager" ]; then
+    tmp="/usr/local/sbin/.yt7-manager.$$"
+    cp -- "$self" "$tmp" || { rm -f "$tmp"; return 1; }
+    chmod 700 "$tmp" || { rm -f "$tmp"; return 1; }
+    mv -f -- "$tmp" /usr/local/sbin/yt7-manager || { rm -f "$tmp"; return 1; }
+  else
+    chmod 700 /usr/local/sbin/yt7-manager || return 1
+  fi
+  ln -sfn /usr/local/sbin/yt7-manager /usr/local/bin/yt
+}
+
+ensure_main_policy_guard(){
+  [ -f "$SD/main" ] || return 0
+  [ -x /usr/local/sbin/yt7-main-policy.sh ] || return 0
+  . "$SD/main"
+  valid_main_tunnel_ip "${MAIN_IP:-}" || return 0
+  cat >/etc/systemd/system/yt7-main-policy-guard.service <<'EOF'
+[Unit]
+Description=YT7 MAIN policy self-heal
+After=wg-quick@ytwg0.service
+ConditionPathExists=/usr/local/sbin/yt7-main-policy.sh
+ConditionPathExists=/sys/class/net/ytwg0
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/yt7-main-policy.sh apply
+EOF
+  cat >/etc/systemd/system/yt7-main-policy-guard.timer <<'EOF'
+[Unit]
+Description=YT7 MAIN policy self-heal timer
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+AccuracySec=10s
+Persistent=true
+Unit=yt7-main-policy-guard.service
+[Install]
+WantedBy=timers.target
+EOF
+  chmod 644 /etc/systemd/system/yt7-main-policy-guard.service /etc/systemd/system/yt7-main-policy-guard.timer
+  systemctl daemon-reload
+  systemctl enable --now yt7-main-policy-guard.timer >/dev/null
+  # Chỉ self-heal ngay khi WG thực sự đang hoạt động. Nếu WG đang down,
+  # timer sẽ chờ lần sau thay vì để lại rule/policy dở dang.
+  if systemctl is-active --quiet "wg-quick@$IF" && ip link show dev "$IF" >/dev/null 2>&1; then
+    /usr/local/sbin/yt7-main-policy.sh apply
+  fi
+}
+
 menu(){
  echo "YT7 Unified v$V"; echo "1) Cài EXIT mới"; echo "2) Cài MAIN mới"; echo "3) Thêm MAIN vào EXIT"; echo "4) Test MAIN"; echo "5) Status"; echo "6) In cấu hình Panel"
  read -rp "Chọn: " X
  case $X in 1) setup_exit;;2) setup_main;;3) read -rp "MAIN Public Key: " K;read -rp "MAIN tunnel IP: " M;add_peer "$K" "$M";;4)test_main;;5)status;;6)panel;;*)die "Sai lựa chọn";;esac
 }
 root
+install_launcher || warn "Không cài/cập nhật được lệnh yt; vẫn tiếp tục chạy script hiện tại."
+ensure_main_policy_guard || warn "Không cài/cập nhật được policy guard; vẫn tiếp tục menu."
 case ${1:-menu} in
  setup-exit) setup_exit "${2:-}";; setup-main) setup_main "${2:-}" "${3:-}" "${4:-}" "${5:-}";;
  add-peer) add_peer "${2:-}" "${3:-}";; test-main)test_main;; panel)panel "${2:-}";; status)status;; menu)menu;;

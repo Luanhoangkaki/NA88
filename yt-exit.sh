@@ -10,6 +10,7 @@ MANAGER_FILE="$BASE_DIR/yt-exit.sh"
 MANAGER_BIN="/usr/local/bin/yt"
 DEFAULT_PORT=28443
 METHOD="2022-blake3-aes-128-gcm"
+SERVICE_MARKER="# X-YT-Exit-Managed=true"
 
 RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; CYAN='\033[36m'; BOLD='\033[1m'; RESET='\033[0m'
 
@@ -26,28 +27,57 @@ detect_arch(){
 
 ensure_tools(){
   local miss=0
+  # Script cần systemd thật sự; có binary systemctl nhưng PID 1 không phải systemd thì service sẽ không chạy.
+  if [ "$(cat /proc/1/comm 2>/dev/null || true)" != "systemd" ]; then
+    echo -e "${RED}VPS này không chạy systemd; YT EXIT installer không thể tạo service an toàn.${RESET}"
+    return 1
+  fi
   for c in curl unzip openssl systemctl ss; do have "$c" || miss=1; done
   [ "$miss" -eq 0 ] && return 0
   if have apt-get; then
-    apt-get update -qq
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl unzip openssl iproute2 ca-certificates
+    apt-get update -qq || { echo -e "${RED}apt-get update thất bại.${RESET}"; return 1; }
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl unzip openssl iproute2 ca-certificates || { echo -e "${RED}Cài dependency thất bại.${RESET}"; return 1; }
   elif have dnf; then
-    dnf install -y curl unzip openssl iproute
+    dnf install -y curl unzip openssl iproute ca-certificates || { echo -e "${RED}Cài dependency thất bại.${RESET}"; return 1; }
   elif have yum; then
-    yum install -y curl unzip openssl iproute
+    yum install -y curl unzip openssl iproute ca-certificates || { echo -e "${RED}Cài dependency thất bại.${RESET}"; return 1; }
   else
     echo -e "${RED}Thiếu công cụ cần thiết và không có package manager hỗ trợ.${RESET}"
     return 1
   fi
+
+  # Không báo cài thành công nếu package manager chạy xong nhưng dependency vẫn thiếu.
+  for c in curl unzip openssl systemctl ss; do
+    have "$c" || { echo -e "${RED}Vẫn thiếu dependency: $c${RESET}"; return 1; }
+  done
 }
 
 port_busy(){
   local p="$1"
-  ss -lntup 2>/dev/null | awk '{print $5}' | grep -Eq "[:.]${p}$"
+  # Dùng bộ lọc của ss để tránh bắt nhầm port có đuôi giống nhau (vd. 28443 và 128443).
+  ss -H -lntup "sport = :${p}" 2>/dev/null | grep -q .
 }
 
 public_ip(){
-  curl -4fsS --max-time 6 https://api.ipify.org 2>/dev/null || true
+  local ip url
+  # Không phụ thuộc một dịch vụ duy nhất: nếu endpoint đầu lỗi, thử endpoint kế tiếp.
+  # Chỉ chấp nhận IPv4 dạng số để tránh in HTML/thông báo lỗi vào JSON outbound.
+  for url in \
+    https://api.ipify.org \
+    https://ipv4.icanhazip.com \
+    https://ifconfig.me/ip
+  do
+    ip="$(curl -4fsS --connect-timeout 3 --max-time 6 "$url" 2>/dev/null | tr -d '[:space:]' || true)"
+    if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+      local IFS=. o1 o2 o3 o4
+      read -r o1 o2 o3 o4 <<<"$ip"
+      if [ "$o1" -le 255 ] && [ "$o2" -le 255 ] && [ "$o3" -le 255 ] && [ "$o4" -le 255 ]; then
+        printf '%s\n' "$ip"
+        return 0
+      fi
+    fi
+  done
+  return 1
 }
 
 download_xray(){
@@ -61,7 +91,12 @@ download_xray(){
   url="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${arch}.zip"
   echo -e "${CYAN}→ Tải Xray-core...${RESET}"
   mkdir -p "$(dirname "$XRAY_BIN")"
-  if ! curl -fL --retry 3 --connect-timeout 10 --max-time 180 "$url" -o "$tmp/xray.zip"; then
+  local -a curl_retry=(--retry 3)
+  # --retry-all-errors không có trên một số bản curl cũ; chỉ dùng khi được hỗ trợ.
+  if curl --help all 2>/dev/null | grep -q -- '--retry-all-errors'; then
+    curl_retry+=(--retry-all-errors)
+  fi
+  if ! curl -fL --proto '=https' --tlsv1.2 "${curl_retry[@]}" --connect-timeout 10 --max-time 180 "$url" -o "$tmp/xray.zip"; then
     rm -rf "$tmp"
     echo -e "${RED}Tải Xray-core thất bại.${RESET}"
     return 1
@@ -91,6 +126,7 @@ write_service(){
   cat > "$service_tmp" <<'EOF'
 [Unit]
 Description=YT EXIT Xray Service
+# X-YT-Exit-Managed=true
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=60
@@ -108,7 +144,7 @@ WantedBy=multi-user.target
 EOF
   chmod 0644 "$service_tmp" || { rm -f "$service_tmp"; return 1; }
   mv -f "$service_tmp" "$SERVICE" || { rm -f "$service_tmp"; return 1; }
-  systemctl daemon-reload
+  systemctl daemon-reload || return 1
 }
 
 write_config(){
@@ -146,8 +182,8 @@ write_config(){
   ]
 }
 EOF
-  chmod 600 "$cfg_tmp"
-  mv -f "$cfg_tmp" "$XRAY_CFG"
+  chmod 600 "$cfg_tmp" || { rm -f "$cfg_tmp"; return 1; }
+  mv -f "$cfg_tmp" "$XRAY_CFG" || { rm -f "$cfg_tmp"; return 1; }
 
   local state_tmp
   state_tmp="$(mktemp "$BASE_DIR/.state.env.tmp.XXXXXX")" || return 1
@@ -156,8 +192,8 @@ PORT=${port}
 METHOD=${METHOD}
 KEY=${key}
 EOF
-  chmod 600 "$state_tmp"
-  mv -f "$state_tmp" "$STATE_FILE"
+  chmod 600 "$state_tmp" || { rm -f "$state_tmp"; return 1; }
+  mv -f "$state_tmp" "$STATE_FILE" || { rm -f "$state_tmp"; return 1; }
 }
 
 load_state(){
@@ -167,23 +203,38 @@ load_state(){
   KEY="$(sed -n 's/^KEY=//p' "$STATE_FILE" | head -n1)"
 }
 
+valid_key(){
+  local k="$1" decoded_len
+  [ -n "$k" ] || return 1
+  [[ "$k" != *$'\n'* && "$k" != *$'\r'* ]] || return 1
+  decoded_len="$(printf '%s' "$k" | openssl base64 -d -A 2>/dev/null | wc -c | tr -d ' ')"
+  [ "$decoded_len" = "16" ]
+}
+
 installed_ok(){
   load_state
   [ -x "$XRAY_BIN" ] &&
   [ -f "$XRAY_CFG" ] &&
   [ -f "$SERVICE" ] &&
+  grep -Fqx "$SERVICE_MARKER" "$SERVICE" 2>/dev/null &&
+  [ "$(stat -c %a "$XRAY_CFG" 2>/dev/null || true)" = "600" ] &&
+  [ "$(stat -c %a "$STATE_FILE" 2>/dev/null || true)" = "600" ] &&
   [[ "${PORT:-}" =~ ^[0-9]+$ ]] &&
   [ "$PORT" -ge 1024 ] &&
   [ "$PORT" -le 65535 ] &&
-  [ -n "${KEY:-}" ] &&
-  [[ "$KEY" != *$'\n'* ]] &&
-  [[ "$KEY" != *$'\r'* ]]
+  valid_key "${KEY:-}"
 }
 
 listeners_ok(){
-  local p="$1"
-  ss -lntp 2>/dev/null | grep -q ":${p} " &&
-  ss -lnup 2>/dev/null | grep -q ":${p} "
+  local p="$1" pid tcp udp
+  pid="$(systemctl show -p MainPID --value yt-exit 2>/dev/null || true)"
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  # Xác nhận MainPID thực sự là binary YT EXIT, tránh PASS nhầm nếu unit trỏ sang tiến trình khác.
+  [ "$(readlink -f "/proc/${pid}/exe" 2>/dev/null || true)" = "$(readlink -f "$XRAY_BIN" 2>/dev/null || true)" ] || return 1
+  tcp="$(ss -H -lntp "sport = :${p}" 2>/dev/null || true)"
+  udp="$(ss -H -lnup "sport = :${p}" 2>/dev/null || true)"
+  # Không chỉ kiểm tra có listener: listener phải thuộc đúng MainPID của yt-exit.
+  grep -Fq "pid=${pid}," <<<"$tcp" && grep -Fq "pid=${pid}," <<<"$udp"
 }
 
 firewall_notice(){
@@ -236,8 +287,39 @@ print_info(){
 EOF
 }
 
+service_exists_anywhere(){
+  # Kiểm tra trực tiếp file /etc trước: một unit vừa được đặt ở đây nhưng chưa daemon-reload
+  # có thể chưa xuất hiện trong FragmentPath. Sau đó kiểm tra unit mà systemd đang nạp ở mọi load path.
+  [ -e "$SERVICE" ] && return 0
+  local fragment
+  fragment="$(systemctl show -p FragmentPath --value yt-exit.service 2>/dev/null || true)"
+  [ -n "$fragment" ] && [ -e "$fragment" ]
+}
+
+service_owned_by_us(){
+  # Marker trong file /etc là nguồn nhận diện chính. FragmentPath có thể còn rỗng nếu file vừa
+  # được tạo nhưng systemd chưa daemon-reload. Nếu systemd đã nạp một unit khác cùng tên thì
+  # chỉ chấp nhận khi FragmentPath chính là file do YT EXIT quản lý.
+  local fragment service_real fragment_real
+  [ -f "$SERVICE" ] && grep -Fqx "$SERVICE_MARKER" "$SERVICE" 2>/dev/null || return 1
+  service_real="$(readlink -f "$SERVICE" 2>/dev/null || true)"
+  fragment="$(systemctl show -p FragmentPath --value yt-exit.service 2>/dev/null || true)"
+  [ -z "$fragment" ] && return 0
+  fragment_real="$(readlink -f "$fragment" 2>/dev/null || true)"
+  [ -n "$service_real" ] && [ "$fragment_real" = "$service_real" ]
+}
+
 install_exit(){
   ensure_tools || return 1
+
+  # Không ghi đè/shadow một systemd unit cùng tên ở bất kỳ systemd load path nào.
+  if service_exists_anywhere && ! service_owned_by_us; then
+    local existing_fragment
+    existing_fragment="$(systemctl show -p FragmentPath --value yt-exit.service 2>/dev/null || true)"
+    echo -e "${RED}Phát hiện yt-exit.service đã tồn tại (${existing_fragment:-không rõ vị trí}) nhưng không thuộc YT EXIT.${RESET}"
+    echo "Dừng cài đặt để không ghi đè hoặc shadow service khác trên VPS."
+    return 1
+  fi
   local port key had_running=0 had_enabled=0 had_binary=0 reinstall_ans="" src_real="" dst_real="" manager_saved=0 prompt_port="$DEFAULT_PORT"
 
   # Ghi nhớ trạng thái cũ để rollback có thể khôi phục chính xác hơn.
@@ -350,12 +432,20 @@ install_exit(){
   fi
 
   key="$(openssl rand -base64 16)" || { rollback_install; return 1; }
+  valid_key "$key" || { echo -e "${RED}Tạo key SS2022 không hợp lệ.${RESET}"; rollback_install; return 1; }
   write_config "$port" "$key" || { rollback_install; return 1; }
   write_service || { rollback_install; return 1; }
 
   echo -e "${CYAN}→ Kiểm tra config...${RESET}"
   if ! "$XRAY_BIN" run -test -config "$XRAY_CFG"; then
     echo -e "${RED}Config Xray không hợp lệ.${RESET}"
+    rollback_install
+    return 1
+  fi
+
+  # Kiểm tra lại binary/config ngay trước khi enable service.
+  if [ ! -x "$XRAY_BIN" ] || [ ! -s "$XRAY_CFG" ]; then
+    echo -e "${RED}Thiếu binary hoặc config YT EXIT sau khi cài.${RESET}"
     rollback_install
     return 1
   fi
@@ -374,14 +464,16 @@ install_exit(){
 
   if ! systemctl is-active --quiet yt-exit || ! listeners_ok "$port"; then
     echo -e "${RED}Health-check thất bại: cần cả service active + TCP + UDP listener.${RESET}"
-    ss -lntup | grep ":${port}" || true
+    ss -H -lntup "sport = :${port}" 2>/dev/null || true
     rollback_install
     return 1
   fi
 
   # Lưu manager trong thư mục riêng, sau đó tạo lệnh ngắn "yt".
-  # Không ghi đè một lệnh /usr/local/bin/yt không thuộc YT EXIT.
-  if [ -r "${BASH_SOURCE[0]}" ]; then
+  # Chỉ tự sao chép khi script đang chạy từ một file thường. Khi chạy kiểu
+  # `bash <(curl ...)`, BASH_SOURCE là /dev/fd/* (pipe) và sao chép lại có thể
+  # tạo manager bị thiếu/truncated. EXIT vẫn hoạt động; installer sẽ cảnh báo.
+  if [ -f "${BASH_SOURCE[0]}" ] && [ -r "${BASH_SOURCE[0]}" ] && [[ "${BASH_SOURCE[0]}" != /dev/fd/* && "${BASH_SOURCE[0]}" != /proc/*/fd/* ]]; then
     src_real="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)"
     dst_real="$(readlink -f "$MANAGER_FILE" 2>/dev/null || true)"
     if [ -n "$src_real" ] && [ "$src_real" = "$dst_real" ]; then
@@ -389,19 +481,22 @@ install_exit(){
     elif install -m 0755 "${BASH_SOURCE[0]}" "$MANAGER_FILE" 2>/dev/null; then
       manager_saved=1
     else
-      manager_saved=0
       echo -e "${YELLOW}LƯU Ý: không lưu được manager vào $MANAGER_FILE; EXIT vẫn chạy bình thường.${RESET}"
     fi
+  else
+    echo -e "${YELLOW}LƯU Ý: installer đang chạy từ pipe /dev/fd nên không tự lưu manager để tránh file bị thiếu.${RESET}"
+    echo "Nếu muốn có lệnh 'yt', hãy tải script thành file rồi chạy file đó một lần."
+  fi
 
-    if [ "$manager_saved" -eq 1 ]; then
-      if [ -L "$MANAGER_BIN" ] && [ "$(readlink -f "$MANAGER_BIN" 2>/dev/null || true)" = "$MANAGER_FILE" ]; then
-        :
-      elif [ -e "$MANAGER_BIN" ] || [ -L "$MANAGER_BIN" ]; then
-        echo -e "${YELLOW}LƯU Ý: $MANAGER_BIN đã tồn tại và không thuộc YT EXIT.${RESET}"
-        echo "Không ghi đè lệnh đó. Bạn vẫn có thể chạy: $MANAGER_FILE"
-      else
-        ln -s "$MANAGER_FILE" "$MANAGER_BIN" ||           echo -e "${YELLOW}LƯU Ý: không tạo được lệnh 'yt'; EXIT vẫn chạy bình thường.${RESET}"
-      fi
+  if [ "$manager_saved" -eq 1 ]; then
+    if [ -L "$MANAGER_BIN" ] && [ "$(readlink -f "$MANAGER_BIN" 2>/dev/null || true)" = "$MANAGER_FILE" ]; then
+      :
+    elif [ -e "$MANAGER_BIN" ] || [ -L "$MANAGER_BIN" ]; then
+      echo -e "${YELLOW}LƯU Ý: $MANAGER_BIN đã tồn tại và không thuộc YT EXIT.${RESET}"
+      echo "Không ghi đè lệnh đó. Bạn vẫn có thể chạy: $MANAGER_FILE"
+    else
+      ln -s "$MANAGER_FILE" "$MANAGER_BIN" || \
+        echo -e "${YELLOW}LƯU Ý: không tạo được lệnh 'yt'; EXIT vẫn chạy bình thường.${RESET}"
     fi
   fi
 
@@ -428,7 +523,7 @@ status_exit(){
   else
     echo -e "YT EXIT: ${RED}inactive${RESET}"
   fi
-  ss -lntup | grep ":${PORT}" || true
+  ss -H -lntup "sport = :${PORT}" 2>/dev/null || true
 }
 
 test_exit(){
@@ -457,7 +552,12 @@ change_exit(){
   fi
 
   read -r -p "Tạo key mới? [y/N]: " ans
-  if [[ "${ans:-}" =~ ^[Yy]$ ]]; then nk="$(openssl rand -base64 16)"; else nk="$KEY"; fi
+  if [[ "${ans:-}" =~ ^[Yy]$ ]]; then
+    nk="$(openssl rand -base64 16)" || { echo -e "${RED}Không tạo được key mới.${RESET}"; return 1; }
+    valid_key "$nk" || { echo -e "${RED}Key mới không hợp lệ.${RESET}"; return 1; }
+  else
+    nk="$KEY"
+  fi
 
   local cfg_bak state_bak
   cfg_bak="$(mktemp)" || { echo -e "${RED}Không tạo được file backup tạm.${RESET}"; return 1; }
@@ -556,11 +656,22 @@ update_xray(){
 
 uninstall_exit(){
   local ans
+  # Nếu systemd có unit cùng tên nhưng không phải unit do script quản lý, tuyệt đối không
+  # disable/stop nó trong quá trình uninstall.
+  if service_exists_anywhere && ! service_owned_by_us; then
+    local existing_fragment
+    existing_fragment="$(systemctl show -p FragmentPath --value yt-exit.service 2>/dev/null || true)"
+    echo -e "${RED}yt-exit.service (${existing_fragment:-không rõ vị trí}) không thuộc YT EXIT; từ chối gỡ để bảo vệ service khác.${RESET}"
+    return 1
+  fi
   read -r -p "Gỡ YT EXIT? [y/N]: " ans
   [[ "${ans:-}" =~ ^[Yy]$ ]] || return 0
   systemctl disable --now yt-exit >/dev/null 2>&1 || true
-  rm -f "$SERVICE"
-  systemctl daemon-reload
+  rm -f "$SERVICE" || { echo -e "${RED}Không xóa được service YT EXIT.${RESET}"; return 1; }
+  if ! systemctl daemon-reload; then
+    echo -e "${RED}systemctl daemon-reload thất bại; dừng gỡ để tránh báo thành công sai.${RESET}"
+    return 1
+  fi
   if [ -L "$MANAGER_BIN" ] && [ "$(readlink -f "$MANAGER_BIN" 2>/dev/null || true)" = "$MANAGER_FILE" ]; then
     rm -f "$MANAGER_BIN"
   fi

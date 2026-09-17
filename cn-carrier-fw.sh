@@ -12,7 +12,7 @@
 set -Eeuo pipefail
 
 APP="cn-carrier-fw"
-VERSION="3.1.1-selfupdate"
+VERSION="3.2-selfupdate"
 INSTALL_PATH="/usr/local/sbin/cn-carrier-fw"
 
 CONF_DIR="/etc/cn-carrier-fw"
@@ -615,35 +615,31 @@ self_update() {
   cp -f "$INSTALL_PATH" "$backup"
   chmod 700 "$backup"
 
-  cp -f "$tmp" "$INSTALL_PATH"
-  chmod 700 "$INSTALL_PATH"
+  if ! install -m 700 "$tmp" "$INSTALL_PATH"; then
+    rm -f "$tmp"
+    err "Không thể thay file chương trình. Giữ nguyên bản cũ."
+    cp -f "$backup" "$INSTALL_PATH" 2>/dev/null || true
+    chmod 700 "$INSTALL_PATH" 2>/dev/null || true
+    return 1
+  fi
   rm -f "$tmp"
 
   if ! bash -n "$INSTALL_PATH"; then
     err "Bản mới lỗi sau khi cài. Đang rollback..."
     cp -f "$backup" "$INSTALL_PATH"
     chmod 700 "$INSTALL_PATH"
+    rm -f "$backup"
     return 1
   fi
 
-  log "[+] Đã thay code: $oldver -> $newver"
-  log "[+] Đang áp dụng lại cấu hình đã lưu bằng bản mới..."
-
-  # Chạy bản mới trong process mới. Nếu apply thất bại, rollback code cũ.
-  if CNCFW_PARENT_LOCK_HELD=1 "$INSTALL_PATH" --apply-saved; then
-    rm -f "$backup"
-    log "[+] SELF-UPDATE HOÀN TẤT."
-    return 0
-  fi
-
-  err "Bản mới chạy --apply-saved thất bại. Đang rollback code cũ..."
-  cp -f "$backup" "$INSTALL_PATH"
-  chmod 700 "$INSTALL_PATH"
   rm -f "$backup"
+  systemctl daemon-reload >/dev/null 2>&1 || true
 
-  # Cố gắng áp dụng lại cấu hình bằng bản cũ.
-  CNCFW_PARENT_LOCK_HELD=1 "$INSTALL_PATH" --apply-saved || true
-  return 1
+  log "[+] SELF-UPDATE HOÀN TẤT: $oldver -> $newver"
+  log "[+] Firewall hiện tại được GIỮ NGUYÊN, không tải lại 19k/10k prefix."
+  log "[+] Lần mở cn-carrier-fw tiếp theo sẽ chạy code mới."
+  log "[+] Nếu muốn cập nhật prefix ngay, chọn mục 8."
+  return 0
 }
 
 remove_all() {
@@ -827,15 +823,10 @@ main() {
 
   install_packages
 
-  # Bình thường mỗi process phải giữ lock riêng để tránh timer/menu chạy đồng thời.
-  # Riêng child --apply-saved do self_update gọi sẽ kế thừa parent đang giữ lock,
-  # nên không được cố flock lần hai.
-  if [[ "${CNCFW_PARENT_LOCK_HELD:-0}" != "1" ]]; then
-    exec 9>"$LOCK_FILE"
-    if ! flock -n 9; then
-      err "Một tiến trình $APP khác đang chạy. Hãy thử lại sau."
-      exit 1
-    fi
+  exec 9>"$LOCK_FILE"
+  if ! flock -n 9; then
+    err "Một tiến trình $APP khác đang chạy. Hãy thử lại sau."
+    exit 1
   fi
 
   install_self

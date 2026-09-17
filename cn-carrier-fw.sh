@@ -12,7 +12,7 @@
 set -Eeuo pipefail
 
 APP="cn-carrier-fw"
-VERSION="3.2-selfupdate"
+VERSION="3.3.11-cache-commit-safe"
 INSTALL_PATH="/usr/local/sbin/cn-carrier-fw"
 
 CONF_DIR="/etc/cn-carrier-fw"
@@ -68,6 +68,7 @@ TELECOM_ASNS=(
   140328 140329 140330 140331 140332 140333 140334 140335 140336 140337
   140484 140494 140527 140553 140638
   141006 141679 141739 141771 146966 147038 151185 151823
+  58461 136190
 )
 
 UNICOM_ASNS=(
@@ -109,11 +110,31 @@ install_packages() {
 }
 
 install_self() {
+  local source_file resolved_source
   mkdir -p "$CONF_DIR" "$CACHE_DIR"
-  if [[ "$(readlink -f "$0")" != "$INSTALL_PATH" ]]; then
-    cp -f "$0" "$INSTALL_PATH"
-    chmod 700 "$INSTALL_PATH"
+
+  # BASH_SOURCE an toàn hơn $0 khi script được gọi bằng bash <(...).
+  source_file="${BASH_SOURCE[0]}"
+  resolved_source="$(readlink -f "$source_file" 2>/dev/null || printf '%s' "$source_file")"
+
+  if [[ "$resolved_source" == "$INSTALL_PATH" ]]; then
+    return 0
   fi
+
+  # Không copy nhầm binary "bash" hoặc nguồn không còn tồn tại.
+  if [[ ! -r "$source_file" ]]; then
+    err "Không đọc được file nguồn để cài vào $INSTALL_PATH"
+    err "Hãy tải script thành file rồi chạy lại."
+    return 1
+  fi
+
+  # Chỉ tự cài nếu đúng script của chương trình.
+  if ! grep -q '^APP="cn-carrier-fw"' "$source_file" 2>/dev/null; then
+    err "Nguồn chạy hiện tại không phải script $APP; không tự ghi đè $INSTALL_PATH."
+    return 1
+  fi
+
+  install -m 700 "$source_file" "$INSTALL_PATH"
 }
 
 save_choice() {
@@ -125,16 +146,21 @@ EOF
 }
 
 load_choice() {
+  local line value
+
   if [[ ! -f "$CONF_FILE" ]]; then
     err "Chưa có cấu hình đã lưu. Hãy chạy: $INSTALL_PATH"
     exit 1
   fi
 
-  # shellcheck disable=SC1090
-  source "$CONF_FILE"
+  # Không source file cấu hình. Chỉ chấp nhận đúng một giá trị CHOICE=1..6.
+  line="$(grep -E '^CHOICE="?([1-6])"?$' "$CONF_FILE" | tail -n1 || true)"
+  value="${line#CHOICE=}"
+  value="${value%\"}"
+  value="${value#\"}"
 
-  case "${CHOICE:-}" in
-    1|2|3|4|5|6) ;;
+  case "$value" in
+    1|2|3|4|5|6) CHOICE="$value" ;;
     *)
       err "File cấu hình không hợp lệ."
       exit 1
@@ -175,7 +201,7 @@ build_asn_list() {
 fetch_prefixes() {
   local choice="$1"
   local tmpdir jsonfile asn
-  local cache4 cache6 cacheok tmp4 tmp6
+  local cache4 cache6 cacheok tmp4 tmp6 cache4_tmp cache6_tmp
   local failed=0 reused=0
 
   tmpdir="$(mktemp -d)"
@@ -200,7 +226,7 @@ fetch_prefixes() {
 
     if curl --connect-timeout 8 --max-time 30 \
       --retry 2 --retry-delay 2 -fsSL \
-      "https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS${asn}" \
+      "https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS${asn}&min_peers_seeing=1" \
       -o "$jsonfile" \
       && jq -e '.status == "ok" and (.data.prefixes | type == "array")' \
         "$jsonfile" >/dev/null 2>&1; then
@@ -208,9 +234,28 @@ fetch_prefixes() {
       jq -r '.data.prefixes[]?.prefix' "$jsonfile" | grep -Fv ':' >"$tmp4" || true
       jq -r '.data.prefixes[]?.prefix' "$jsonfile" | grep -F ':'  >"$tmp6" || true
 
-      cp -f "$tmp4" "$cache4"
-      cp -f "$tmp6" "$cache6"
-      : >"$cacheok"
+      # Cache commit có marker: bỏ marker cũ trước khi thay bất kỳ dữ liệu nào.
+      # Nếu tiến trình chết giữa chừng, lần sau sẽ không dùng cache nửa cũ/nửa mới.
+      rm -f "$cacheok"
+      cache4_tmp="${cache4}.tmp.$$"
+      cache6_tmp="${cache6}.tmp.$$"
+      rm -f "$cache4_tmp" "$cache6_tmp"
+
+      if cp -f "$tmp4" "$cache4_tmp" && cp -f "$tmp6" "$cache6_tmp"; then
+        # Marker phải tiếp tục vắng trong toàn bộ cửa sổ commit.
+        # fsync thư mục không cần thiết cho correctness runtime; marker là commit flag.
+        rm -f "$cacheok"
+        mv -f "$cache4_tmp" "$cache4"
+        rm -f "$cacheok"
+        mv -f "$cache6_tmp" "$cache6"
+        rm -f "$cacheok"
+        : >"$cacheok"
+      else
+        rm -f "$cache4_tmp" "$cache6_tmp" "$cacheok"
+        rm -rf "$tmpdir"
+        err "Không ghi được cache cho AS${asn}. Giữ nguyên firewall/IPSet cũ."
+        return 1
+      fi
 
       cat "$tmp4" >>"$tmpdir/all4"
       cat "$tmp6" >>"$tmpdir/all6"
@@ -255,8 +300,41 @@ fetch_prefixes() {
     return 1
   fi
 
-  cp -f "$tmpdir/all4" "$PREFIX4_FILE"
-  cp -f "$tmpdir/all6" "$PREFIX6_FILE"
+  # Xác thực toàn bộ prefix bằng ipset tạm trước khi ghi file cập nhật.
+  # Nếu RIPEstat/cache có một dòng lỗi, firewall cũ vẫn được giữ nguyên.
+  local validate4="cncfw_validate4_$$" validate6="cncfw_validate6_$$"
+  ipset destroy "$validate4" 2>/dev/null || true
+  ipset destroy "$validate6" 2>/dev/null || true
+
+  if ! ipset create "$validate4" hash:net family inet maxelem 1000000; then
+    rm -rf "$tmpdir"
+    err "Không tạo được IPv4 validation IPSet. Giữ nguyên firewall/IPSet cũ."
+    return 1
+  fi
+  if ! ipset create "$validate6" hash:net family inet6 maxelem 1000000; then
+    ipset destroy "$validate4" 2>/dev/null || true
+    rm -rf "$tmpdir"
+    err "Không tạo được IPv6 validation IPSet. Giữ nguyên firewall/IPSet cũ."
+    return 1
+  fi
+
+  if ! awk -v s="$validate4" 'NF {print "add " s " " $0}' "$tmpdir/all4" | ipset restore      || ! awk -v s="$validate6" 'NF {print "add " s " " $0}' "$tmpdir/all6" | ipset restore; then
+    ipset destroy "$validate4" 2>/dev/null || true
+    ipset destroy "$validate6" 2>/dev/null || true
+    rm -rf "$tmpdir"
+    err "Dữ liệu prefix có dòng không hợp lệ. Giữ nguyên firewall/IPSet cũ."
+    return 1
+  fi
+  ipset destroy "$validate4"
+  ipset destroy "$validate6"
+
+  # Stage cả hai file prefix; nếu một bước lỗi thì xóa cả hai staging file.
+  if ! cp -f "$tmpdir/all4" "$PREFIX4_FILE" || ! cp -f "$tmpdir/all6" "$PREFIX6_FILE"; then
+    rm -f "$PREFIX4_FILE" "$PREFIX6_FILE"
+    rm -rf "$tmpdir"
+    err "Không ghi được file prefix staging. Giữ nguyên firewall/IPSet cũ."
+    return 1
+  fi
   rm -rf "$tmpdir"
 
   if (( reused > 0 )); then
@@ -265,6 +343,18 @@ fetch_prefixes() {
 
   log "[+] Tổng prefix IPv4: $PREFIX4_COUNT"
   log "[+] Tổng prefix IPv6: $PREFIX6_COUNT"
+}
+
+preflight_firewall() {
+  # Kiểm tra backend trước khi thay đổi live IPSet.
+  iptables -m set -h >/dev/null 2>&1 || {
+    err "iptables không hỗ trợ match-set/ipset. Giữ nguyên firewall cũ."
+    return 1
+  }
+  ip6tables -m set -h >/dev/null 2>&1 || {
+    err "ip6tables không hỗ trợ match-set/ipset. Giữ nguyên firewall cũ."
+    return 1
+  }
 }
 
 update_ipsets_atomic() {
@@ -290,8 +380,27 @@ update_ipsets_atomic() {
   ipset create "$SET4" hash:net family inet  hashsize 131072 maxelem 1000000 -exist
   ipset create "$SET6" hash:net family inet6 hashsize 32768  maxelem 1000000 -exist
 
-  ipset swap "$SET4_NEW" "$SET4"
-  ipset swap "$SET6_NEW" "$SET6"
+  # Hai swap không thể là một transaction kernel duy nhất. Nếu IPv6 swap lỗi
+  # sau khi IPv4 đã swap, swap IPv4 ngược lại để tránh trạng thái mixed-generation.
+  if ! ipset swap "$SET4_NEW" "$SET4"; then
+    ipset destroy "$SET4_NEW" 2>/dev/null || true
+    ipset destroy "$SET6_NEW" 2>/dev/null || true
+    err "Không swap được IPv4 IPSet. Giữ nguyên firewall cũ."
+    return 1
+  fi
+
+  if ! ipset swap "$SET6_NEW" "$SET6"; then
+    warn "[!] IPv6 swap thất bại. Đang rollback IPv4..."
+    if ! ipset swap "$SET4_NEW" "$SET4"; then
+      err "ROLLBACK IPv4 thất bại. Cần kiểm tra firewall ngay."
+      # Giữ các set tạm để có dữ liệu phục hồi thủ công, không destroy.
+      return 1
+    fi
+    ipset destroy "$SET4_NEW" 2>/dev/null || true
+    ipset destroy "$SET6_NEW" 2>/dev/null || true
+    err "Không swap được IPv6 IPSet. IPv4 đã rollback về dữ liệu cũ."
+    return 1
+  fi
 
   ipset destroy "$SET4_NEW"
   ipset destroy "$SET6_NEW"
@@ -402,19 +511,37 @@ verify_firewall() {
 }
 
 save_ipsets() {
-  : >"$IPSET_SAVE"
-  ipset save "$SET4" >>"$IPSET_SAVE"
-  ipset save "$SET6" >>"$IPSET_SAVE"
-
-  [[ -s "$IPSET_SAVE" ]] || {
-    err "Không lưu được IPSet persistent."
+  local tmp
+  tmp="$(mktemp "${CONF_DIR}/ipset.rules.tmp.XXXXXX")" || {
+    err "Không tạo được file tạm để lưu IPSet."
     return 1
   }
+
+  if ! ipset save "$SET4" >"$tmp" || ! ipset save "$SET6" >>"$tmp"; then
+    rm -f "$tmp"
+    err "Không lưu được IPSet persistent."
+    return 1
+  fi
+
+  if [[ ! -s "$tmp" ]]; then
+    rm -f "$tmp"
+    err "File IPSet persistent bị rỗng."
+    return 1
+  fi
+
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$IPSET_SAVE"
 }
 
 save_persistence() {
+  local ipset_bin
   mkdir -p "$CONF_DIR"
   save_ipsets
+
+  ipset_bin="$(command -v ipset)" || {
+    err "Không tìm thấy binary ipset."
+    return 1
+  }
 
   cat >"/etc/systemd/system/$RESTORE_SERVICE" <<EOF
 [Unit]
@@ -422,10 +549,11 @@ Description=Restore China Carrier Firewall IPv4/IPv6 ipsets
 DefaultDependencies=no
 After=local-fs.target
 Before=netfilter-persistent.service
+ConditionPathIsReadable=$IPSET_SAVE
 
 [Service]
 Type=oneshot
-ExecStart=/bin/sh -c '/sbin/ipset restore -exist < $IPSET_SAVE'
+ExecStart=/bin/sh -ec '$ipset_bin restore -exist < "$IPSET_SAVE"'
 RemainAfterExit=yes
 
 [Install]
@@ -469,9 +597,13 @@ EOF
   systemctl daemon-reload
   systemctl enable "$RESTORE_SERVICE" >/dev/null
   systemctl enable "$UPDATE_TIMER" >/dev/null
-  systemctl is-active --quiet "$UPDATE_TIMER" || systemctl start "$UPDATE_TIMER"
+  systemctl enable netfilter-persistent.service >/dev/null 2>&1 || {
+    err "Không enable được netfilter-persistent.service"
+    return 1
+  }
 
-  # iptables-persistent lưu cả /etc/iptables/rules.v4 và rules.v6.
+  # Chỉ kích hoạt timer sau khi firewall đã được lưu persistent thành công.
+  # Tránh trạng thái cài đặt dở dang nhưng timer vẫn chạy.
   netfilter-persistent save >/dev/null
 
   [[ -s /etc/iptables/rules.v4 ]] || {
@@ -483,6 +615,21 @@ EOF
     err "Không thấy /etc/iptables/rules.v6 sau khi save."
     return 1
   }
+
+  systemctl is-enabled --quiet "$RESTORE_SERVICE" || {
+    err "$RESTORE_SERVICE chưa được enable."
+    return 1
+  }
+  systemctl is-enabled --quiet "$UPDATE_TIMER" || {
+    err "$UPDATE_TIMER chưa được enable."
+    return 1
+  }
+  systemctl is-enabled --quiet netfilter-persistent.service || {
+    err "netfilter-persistent.service chưa được enable."
+    return 1
+  }
+
+  systemctl is-active --quiet "$UPDATE_TIMER" || systemctl start "$UPDATE_TIMER"
 }
 
 apply_choice() {
@@ -491,6 +638,7 @@ apply_choice() {
   rm -f "$PREFIX4_FILE" "$PREFIX6_FILE"
 
   fetch_prefixes "$choice"
+  preflight_firewall
   update_ipsets_atomic
   apply_firewall
   verify_firewall
@@ -612,14 +760,20 @@ self_update() {
     return 0
   fi
 
-  cp -f "$INSTALL_PATH" "$backup"
-  chmod 700 "$backup"
+  if [[ -f "$INSTALL_PATH" ]]; then
+    cp -f "$INSTALL_PATH" "$backup"
+    chmod 700 "$backup"
+  else
+    cp -f "${BASH_SOURCE[0]}" "$backup"
+    chmod 700 "$backup"
+  fi
 
   if ! install -m 700 "$tmp" "$INSTALL_PATH"; then
     rm -f "$tmp"
     err "Không thể thay file chương trình. Giữ nguyên bản cũ."
     cp -f "$backup" "$INSTALL_PATH" 2>/dev/null || true
     chmod 700 "$INSTALL_PATH" 2>/dev/null || true
+    rm -f "$backup"
     return 1
   fi
   rm -f "$tmp"
@@ -659,7 +813,7 @@ remove_all() {
   ipset destroy cn_ut_block 2>/dev/null || true
 
   systemctl disable --now "$UPDATE_TIMER" >/dev/null 2>&1 || true
-  systemctl disable "$RESTORE_SERVICE" >/dev/null 2>&1 || true
+  systemctl disable --now "$RESTORE_SERVICE" >/dev/null 2>&1 || true
 
   rm -f \
     "/etc/systemd/system/$RESTORE_SERVICE" \
@@ -700,6 +854,71 @@ show_family_rules() {
   echo
   echo "--- $label FORWARD ---"
   "$fw" -L "$CHAIN_FWD" -n -v 2>/dev/null || true
+}
+
+
+check_ip() {
+  local ip="${1:-}"
+  local setname family json asn_list prefix
+
+  if [[ -z "$ip" ]]; then
+    err "Thiếu IP. Ví dụ: cn-carrier-fw --check-ip 1.2.3.4"
+    return 1
+  fi
+
+  # Chỉ nhận IP đơn, không nhận CIDR/hostname/chuỗi tùy ý.
+  if [[ "$ip" == */* || "$ip" =~ [[:space:]] ]]; then
+    err "IP không hợp lệ: $ip"
+    return 1
+  fi
+
+  if [[ "$ip" == *:* ]]; then
+    family="IPv6"
+    # ip6tables dùng inet_pton; dùng Python nếu có để xác thực chính xác.
+    if command -v python3 >/dev/null 2>&1; then
+      python3 - "$ip" <<'PY' >/dev/null 2>&1 || { err "IPv6 không hợp lệ: $ip"; return 1; }
+import ipaddress, sys
+a = ipaddress.ip_address(sys.argv[1])
+raise SystemExit(0 if a.version == 6 else 1)
+PY
+    fi
+    setname="$SET6"
+  else
+    family="IPv4"
+    if ! [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+      err "IPv4 không hợp lệ: $ip"
+      return 1
+    fi
+    IFS=. read -r a b c d <<<"$ip"
+    for octet in "$a" "$b" "$c" "$d"; do
+      (( 10#$octet <= 255 )) || { err "IPv4 không hợp lệ: $ip"; return 1; }
+    done
+    setname="$SET4"
+  fi
+
+  echo "IP: $ip ($family)"
+  if ipset test "$setname" "$ip" >/dev/null 2>&1; then
+    echo "IPSet: BLOCKED ($setname)"
+  else
+    echo "IPSet: NOT BLOCKED ($setname)"
+  fi
+
+  echo "RIPEstat origin:"
+  if ! json="$(curl --connect-timeout 5 --max-time 15 --retry 1 -fsSL \
+      "https://stat.ripe.net/data/prefix-overview/data.json?resource=${ip}&min_peers_seeing=1" 2>/dev/null)"; then
+    echo "Không tra được RIPEstat"
+    return 0
+  fi
+
+  prefix="$(jq -r 'if .status=="ok" then (.data.resource // "?") else "?" end' <<<"$json" 2>/dev/null || echo "?")"
+  asn_list="$(jq -r '
+      if .status=="ok" then
+        [(.data.asns // [])[] | "AS" + (.asn|tostring) + ":" + (.holder // "?")] | join(", ")
+      else ""
+      end
+    ' <<<"$json" 2>/dev/null || true)"
+
+  echo "prefix=$prefix ASN=${asn_list:-?}"
 }
 
 show_status() {
@@ -824,8 +1043,8 @@ main() {
   install_packages
 
   exec 9>"$LOCK_FILE"
-  if ! flock -n 9; then
-    err "Một tiến trình $APP khác đang chạy. Hãy thử lại sau."
+  if ! flock -w 60 9; then
+    err "Một tiến trình $APP khác vẫn đang chạy sau 60 giây. Hãy thử lại sau."
     exit 1
   fi
 
@@ -841,6 +1060,10 @@ main() {
       show_status
       ;;
 
+    --check-ip)
+      check_ip "${2:-}"
+      ;;
+
     --remove)
       remove_all
       ;;
@@ -851,6 +1074,7 @@ $APP $VERSION
   Không tham số      Mở menu
   --apply-saved      Cập nhật IPv4 + IPv6 và áp dụng cấu hình đã lưu
   --status           Xem trạng thái IPv4 + IPv6
+  --check-ip IP      Kiểm tra IP có nằm trong bộ chặn + tra ASN
   --remove           Gỡ toàn bộ IPv4 + IPv6 rule
   Menu 9             Self-update code từ GitHub
 EOF

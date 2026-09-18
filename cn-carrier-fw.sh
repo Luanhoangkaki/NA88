@@ -13,7 +13,7 @@
 set -Eeuo pipefail
 
 APP="cn-carrier-fw"
-VERSION="3.5.5-nft-verify-fix"
+VERSION="3.5.6-ssh-preflight-safe"
 INSTALL_PATH="/usr/local/sbin/cn-carrier-fw"
 
 CONF_DIR="/etc/cn-carrier-fw"
@@ -356,6 +356,92 @@ preflight_firewall() {
   nft list tables >/dev/null 2>&1 || { err "nftables không hoạt động trên kernel/VPS này."; return 1; }
 }
 
+get_management_ip() {
+  local ip=""
+  # Ưu tiên IP nguồn của chính phiên SSH đang chạy.
+  if [[ -n "${SSH_CONNECTION:-}" ]]; then
+    ip="${SSH_CONNECTION%% *}"
+  fi
+  # Khi timer chạy không có SSH_CONNECTION, dùng IP quản trị đã ghi nhận ở lần
+  # apply tương tác thành công gần nhất. Đây KHÔNG phải whitelist; nếu candidate
+  # chứa IP này thì update bị hủy trước khi chạm firewall.
+  if [[ -z "$ip" && -f "$CONF_FILE" ]]; then
+    ip="$(sed -n 's/^MGMT_IP="\([^"]*\)"$/\1/p' "$CONF_FILE" | tail -n1)"
+  fi
+  printf '%s' "$ip"
+}
+
+validate_ip_literal() {
+  local ip="$1"
+  python3 - "$ip" <<'PYIP' >/dev/null 2>&1
+import ipaddress, sys
+try:
+    ipaddress.ip_address(sys.argv[1])
+except ValueError:
+    raise SystemExit(1)
+PYIP
+}
+
+candidate_contains_ip() {
+  local ip="$1" prefix_file="$2"
+  python3 - "$ip" "$prefix_file" <<'PYIP'
+import ipaddress, sys
+ip = ipaddress.ip_address(sys.argv[1])
+with open(sys.argv[2], encoding='utf-8') as f:
+    for line in f:
+        p=line.strip()
+        if not p:
+            continue
+        try:
+            net=ipaddress.ip_network(p, strict=False)
+        except ValueError:
+            continue
+        if ip.version == net.version and ip in net:
+            print(p)
+            raise SystemExit(0)
+raise SystemExit(1)
+PYIP
+}
+
+find_matching_selected_asn() {
+  local ip="$1" asn f match
+  for asn in "${SELECTED_ASNS[@]}"; do
+    if [[ "$ip" == *:* ]]; then f="$CACHE_DIR/as${asn}.v6"; else f="$CACHE_DIR/as${asn}.v4"; fi
+    [[ -f "$f" ]] || continue
+    match="$(candidate_contains_ip "$ip" "$f" 2>/dev/null || true)"
+    if [[ -n "$match" ]]; then
+      printf 'AS%s %s\n' "$asn" "$match"
+    fi
+  done
+}
+
+preflight_management_lockout() {
+  local ip prefix_file match details
+  ip="$(get_management_ip)"
+  if [[ -z "$ip" ]]; then
+    warn "[!] Không có IP quản trị để anti-lockout (không chạy qua SSH và chưa có MGMT_IP lưu)."
+    return 0
+  fi
+  if ! command -v python3 >/dev/null 2>&1 || ! validate_ip_literal "$ip"; then
+    err "IP quản trị không hợp lệ: $ip"
+    return 1
+  fi
+  if [[ "$ip" == *:* ]]; then prefix_file="$PREFIX6_FILE"; else prefix_file="$PREFIX4_FILE"; fi
+  [[ -s "$prefix_file" ]] || { err "Thiếu candidate prefix để kiểm tra anti-lockout."; return 1; }
+
+  match="$(candidate_contains_ip "$ip" "$prefix_file" 2>/dev/null || true)"
+  if [[ -n "$match" ]]; then
+    err "ANTI-LOCKOUT: candidate sẽ chặn IP quản trị $ip"
+    err "Prefix gây match: $match"
+    details="$(find_matching_selected_asn "$ip" || true)"
+    [[ -n "$details" ]] && { err "Nguồn ASN trong lựa chọn hiện tại:"; printf '%s\n' "$details" >&2; }
+    err "ĐÃ HỦY APPLY trước khi thay đổi nftables. SSH/firewall hiện tại được giữ nguyên."
+    return 1
+  fi
+  log "[+] Anti-lockout: IP quản trị $ip không nằm trong candidate block."
+  return 0
+}
+
 build_nft_candidate() {
   local out="$1"
   {
@@ -578,7 +664,7 @@ EOF
 apply_choice() {
   local choice="$1"
   local staged_choice old_live old_persist old_config had_live=0 had_persist=0 had_config=0
-  local systemd_backup restore_helper_backup
+  local systemd_backup restore_helper_backup current_mgmt_ip
   local restore_enabled restore_active update_enabled update_active timer_enabled timer_active
 
   rm -f "$PREFIX4_FILE" "$PREFIX6_FILE"
@@ -588,6 +674,10 @@ apply_choice() {
   # same-filesystem and atomic; this avoids late disk/allocation work after apply.
   staged_choice="$(mktemp "${CONF_DIR}/config.stage.XXXXXX")" || return 1
   printf 'CHOICE="%s"\n' "$choice" >"$staged_choice" || { rm -f "$staged_choice"; return 1; }
+  current_mgmt_ip="$(get_management_ip)"
+  if [[ -n "$current_mgmt_ip" ]] && command -v python3 >/dev/null 2>&1 && validate_ip_literal "$current_mgmt_ip"; then
+    printf 'MGMT_IP="%s"\n' "$current_mgmt_ip" >>"$staged_choice" || { rm -f "$staged_choice"; return 1; }
+  fi
   chmod 600 "$staged_choice" || { rm -f "$staged_choice"; return 1; }
 
   # Snapshots are used only if a post-apply commit step fails.
@@ -666,7 +756,7 @@ apply_choice() {
     [[ "$update_active" == "active" ]] || systemctl stop "$UPDATE_SERVICE" >/dev/null 2>&1 || true
   }
 
-  if ! fetch_prefixes "$choice" || ! preflight_firewall; then
+  if ! fetch_prefixes "$choice" || ! preflight_firewall || ! preflight_management_lockout; then
     rm -f "$staged_choice" "$old_live" "$old_persist" "$old_config"
     [[ -n "${systemd_backup:-}" ]] && rm -rf "$systemd_backup" || true
     return 1
@@ -1005,6 +1095,21 @@ show_status() {
   systemctl list-timers "$UPDATE_TIMER" --no-pager 2>/dev/null || true
 }
 
+dry_run_choice() {
+  local choice="$1"
+  case "$choice" in 1|2|3|4|5|6) ;; *) err "Dry-run cần lựa chọn 1..6"; return 1 ;; esac
+  rm -f "$PREFIX4_FILE" "$PREFIX6_FILE"
+  log "[+] DRY-RUN: $(choice_description "$choice")"
+  log "[+] Chỉ tải/xây candidate và kiểm tra anti-lockout; KHÔNG thay firewall."
+  if fetch_prefixes "$choice" && preflight_firewall && preflight_management_lockout; then
+    log "[+] DRY-RUN PASS: candidate không chặn IP quản trị hiện tại."
+    rm -f "$PREFIX4_FILE" "$PREFIX6_FILE"
+    return 0
+  fi
+  rm -f "$PREFIX4_FILE" "$PREFIX6_FILE"
+  return 1
+}
+
 menu() {
   while true; do
     clear 2>/dev/null || true
@@ -1045,7 +1150,7 @@ EOF
         echo
         warn "Bạn chọn: $(choice_description "$choice")"
         warn "Sẽ chặn ALL protocol trên IPv4 + IPv6, INPUT + OUTPUT + FORWARD."
-        warn "Nếu IP SSH hiện tại thuộc nhà mạng bị chặn, SSH có thể bị ngắt."
+        warn "Script sẽ kiểm tra anti-lockout trước khi apply; nếu IP SSH bị candidate bắt nhầm, thao tác sẽ tự hủy."
         read -r -p "Tiếp tục? [y/N]: " confirm
 
         if [[ "$confirm" =~ ^[Yy]$ ]]; then
@@ -1114,6 +1219,10 @@ main() {
       apply_choice "$CHOICE"
       ;;
 
+    --dry-run)
+      dry_run_choice "${2:-}"
+      ;;
+
     --status)
       show_status
       ;;
@@ -1131,6 +1240,7 @@ main() {
 $APP $VERSION
   Không tham số      Mở menu
   --apply-saved      Cập nhật IPv4 + IPv6 và áp dụng cấu hình đã lưu
+  --dry-run N        Kiểm tra lựa chọn 1..6 + anti-lockout, KHÔNG apply firewall
   --status           Xem trạng thái IPv4 + IPv6
   --check-ip IP      Kiểm tra IP có nằm trong bộ chặn + tra ASN
   --remove           Gỡ toàn bộ IPv4 + IPv6 rule

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # China Carrier Firewall - Dual Stack
 # Chặn China Telecom / China Unicom / China Mobile theo ASN prefix
-# Debian 12/13 - IPv4 + IPv6 - ipset + iptables/ip6tables
+# Debian 11/12/13 + Ubuntu 20.04/22.04/24.04 - IPv4 + IPv6
+# Native nftables backend (modern systems); avoids iptables-nft/ipset incompatibility
 #
 # Chế độ:
 #   cn-carrier-fw                -> menu tương tác
@@ -12,7 +13,7 @@
 set -Eeuo pipefail
 
 APP="cn-carrier-fw"
-VERSION="3.4.1-lowram-safe"
+VERSION="3.5.4-nft-systemd-rollback-safe"
 INSTALL_PATH="/usr/local/sbin/cn-carrier-fw"
 
 CONF_DIR="/etc/cn-carrier-fw"
@@ -101,18 +102,19 @@ need_root() {
 
 install_packages() {
   export DEBIAN_FRONTEND=noninteractive
+  if ! command -v apt-get >/dev/null 2>&1 || ! command -v dpkg >/dev/null 2>&1 || ! command -v systemctl >/dev/null 2>&1; then
+    err "Chỉ hỗ trợ Debian/Ubuntu dùng apt + systemd."
+    return 1
+  fi
   local missing=0
-
-  for c in curl jq ipset iptables ip6tables flock netfilter-persistent; do
-    command -v "$c" >/dev/null 2>&1 || missing=1
-  done
-
-  if [[ "$missing" -eq 1 ]] || ! dpkg -s iptables-persistent >/dev/null 2>&1; then
+  for c in curl jq nft flock; do command -v "$c" >/dev/null 2>&1 || missing=1; done
+  if [[ "$missing" -eq 1 ]]; then
     log "[+] Cài gói cần thiết..."
     apt-get update -qq
-    apt-get install -y -qq \
-      curl jq ipset iptables iptables-persistent util-linux >/dev/null
+    apt-get install -y -qq curl jq nftables util-linux >/dev/null
   fi
+  modprobe nf_tables 2>/dev/null || true
+  nft list tables >/dev/null 2>&1 || { err "Kernel/VPS không cho phép nftables."; return 1; }
 }
 
 install_self() {
@@ -329,33 +331,8 @@ fetch_prefixes() {
     return 1
   fi
 
-  # Xác thực toàn bộ prefix bằng ipset tạm trước khi ghi file cập nhật.
-  # Nếu RIPEstat/cache có một dòng lỗi, firewall cũ vẫn được giữ nguyên.
-  local validate4="cncfw_validate4_$$" validate6="cncfw_validate6_$$"
-  ipset destroy "$validate4" 2>/dev/null || true
-  ipset destroy "$validate6" 2>/dev/null || true
-
-  if ! ipset create "$validate4" hash:net family inet maxelem 262144; then
-    rm -rf "$tmpdir"
-    err "Không tạo được IPv4 validation IPSet. Giữ nguyên firewall/IPSet cũ."
-    return 1
-  fi
-  if ! ipset create "$validate6" hash:net family inet6 maxelem 262144; then
-    ipset destroy "$validate4" 2>/dev/null || true
-    rm -rf "$tmpdir"
-    err "Không tạo được IPv6 validation IPSet. Giữ nguyên firewall/IPSet cũ."
-    return 1
-  fi
-
-  if ! awk -v s="$validate4" 'NF {print "add " s " " $0}' "$tmpdir/all4" | ipset restore      || ! awk -v s="$validate6" 'NF {print "add " s " " $0}' "$tmpdir/all6" | ipset restore; then
-    ipset destroy "$validate4" 2>/dev/null || true
-    ipset destroy "$validate6" 2>/dev/null || true
-    rm -rf "$tmpdir"
-    err "Dữ liệu prefix có dòng không hợp lệ. Giữ nguyên firewall/IPSet cũ."
-    return 1
-  fi
-  ipset destroy "$validate4"
-  ipset destroy "$validate6"
+  # Prefixes are syntactically validated when the candidate nft ruleset is built.
+  # No temporary kernel set is allocated here, reducing peak RAM on 1C/1GB VPS.
 
   # Stage cả hai file prefix; nếu một bước lỗi thì xóa cả hai staging file.
   if ! cp -f "$tmpdir/all4" "$PREFIX4_FILE" || ! cp -f "$tmpdir/all6" "$PREFIX6_FILE"; then
@@ -375,341 +352,355 @@ fetch_prefixes() {
 }
 
 preflight_firewall() {
-  # Kiểm tra backend trước khi thay đổi live IPSet.
-  iptables -m set -h >/dev/null 2>&1 || {
-    err "iptables không hỗ trợ match-set/ipset. Giữ nguyên firewall cũ."
-    return 1
-  }
-  ip6tables -m set -h >/dev/null 2>&1 || {
-    err "ip6tables không hỗ trợ match-set/ipset. Giữ nguyên firewall cũ."
-    return 1
-  }
+  command -v nft >/dev/null 2>&1 || { err "Thiếu nftables."; return 1; }
+  nft list tables >/dev/null 2>&1 || { err "nftables không hoạt động trên kernel/VPS này."; return 1; }
 }
 
-next_pow2() {
-  local n="$1" p=1
-  (( n < 1 )) && n=1
-  while (( p < n )); do p=$((p * 2)); done
-  printf '%s\n' "$p"
-}
-
-ipset_sizing() {
-  # Keep resident hash tables modest on 1C/1GB VPS while leaving headroom.
-  # hashsize is only the initial hash size; maxelem is a safety ceiling.
-  local count="$1" target max
-  target=$(( (count + 3) / 4 ))
-  (( target < 2048 )) && target=2048
-  (( target > 32768 )) && target=32768
-  IPSET_HASHSIZE="$(next_pow2 "$target")"
-
-  max=$(( count * 2 + 1024 ))
-  (( max < 65536 )) && max=65536
-  (( max > 262144 )) && max=262144
-  IPSET_MAXELEM="$(next_pow2 "$max")"
-  (( IPSET_MAXELEM > 262144 )) && IPSET_MAXELEM=262144
+build_nft_candidate() {
+  local out="$1"
+  {
+    echo 'table inet cncfw {'
+    echo '  set block4 {'
+    echo '    type ipv4_addr'
+    echo '    flags interval'
+    echo '    auto-merge'
+    echo '    elements = {'
+    awk 'NF {printf "      %s,\n", $0}' "$PREFIX4_FILE"
+    echo '    }'
+    echo '  }'
+    echo '  set block6 {'
+    echo '    type ipv6_addr'
+    echo '    flags interval'
+    echo '    auto-merge'
+    echo '    elements = {'
+    awk 'NF {printf "      %s,\n", $0}' "$PREFIX6_FILE"
+    echo '    }'
+    echo '  }'
+    echo '  chain input {'
+    echo '    type filter hook input priority -10; policy accept;'
+    echo '    ip saddr @block4 counter drop'
+    echo '    ip6 saddr @block6 counter drop'
+    echo '  }'
+    echo '  chain output {'
+    echo '    type filter hook output priority -10; policy accept;'
+    echo '    ip daddr @block4 counter drop'
+    echo '    ip6 daddr @block6 counter drop'
+    echo '  }'
+    echo '  chain forward {'
+    echo '    type filter hook forward priority -10; policy accept;'
+    echo '    ip saddr @block4 counter drop'
+    echo '    ip daddr @block4 counter drop'
+    echo '    ip6 saddr @block6 counter drop'
+    echo '    ip6 daddr @block6 counter drop'
+    echo '  }'
+    echo '}'
+  } >"$out"
 }
 
 update_ipsets_atomic() {
-  # Tạo set tạm hoàn chỉnh trước. Firewall cũ vẫn hoạt động trong lúc nạp.
-  ipset destroy "$SET4_NEW" 2>/dev/null || true
-  ipset destroy "$SET6_NEW" 2>/dev/null || true
+  # Native nftables transaction: replace only our private table atomically.
+  # IMPORTANT: never create an empty live table before candidate validation.
+  local body batch had_table=0
+  body="$(mktemp "${CONF_DIR}/nft.body.XXXXXX")" || return 1
+  batch="$(mktemp "${CONF_DIR}/nft.batch.XXXXXX")" || { rm -f "$body"; return 1; }
+  build_nft_candidate "$body"
 
-  local hash4 max4 hash6 max6
-  ipset_sizing "$PREFIX4_COUNT"; hash4="$IPSET_HASHSIZE"; max4="$IPSET_MAXELEM"
-  ipset_sizing "$PREFIX6_COUNT"; hash6="$IPSET_HASHSIZE"; max6="$IPSET_MAXELEM"
+  if nft list table inet cncfw >/dev/null 2>&1; then
+    had_table=1
+  fi
 
-  ipset create "$SET4_NEW" hash:net family inet  hashsize "$hash4" maxelem "$max4"
-  ipset create "$SET6_NEW" hash:net family inet6 hashsize "$hash6" maxelem "$max6"
+  if (( had_table )); then
+    {
+      echo 'delete table inet cncfw'
+      cat "$body"
+    } >"$batch"
+  else
+    cat "$body" >"$batch"
+  fi
 
-  {
-    while IFS= read -r net; do
-      [[ -n "$net" ]] && printf 'add %s %s -exist\n' "$SET4_NEW" "$net"
-    done <"$PREFIX4_FILE"
-  } | ipset restore
-
-  {
-    while IFS= read -r net; do
-      [[ -n "$net" ]] && printf 'add %s %s -exist\n' "$SET6_NEW" "$net"
-    done <"$PREFIX6_FILE"
-  } | ipset restore
-
-  ipset create "$SET4" hash:net family inet  hashsize "$hash4" maxelem "$max4" -exist
-  ipset create "$SET6" hash:net family inet6 hashsize "$hash6" maxelem "$max6" -exist
-
-  # Hai swap không thể là một transaction kernel duy nhất. Nếu IPv6 swap lỗi
-  # sau khi IPv4 đã swap, swap IPv4 ngược lại để tránh trạng thái mixed-generation.
-  if ! ipset swap "$SET4_NEW" "$SET4"; then
-    ipset destroy "$SET4_NEW" 2>/dev/null || true
-    ipset destroy "$SET6_NEW" 2>/dev/null || true
-    err "Không swap được IPv4 IPSet. Giữ nguyên firewall cũ."
+  # nft -c performs a dry-run syntax/semantic validation. Nothing live changes here.
+  if ! nft -c -f "$batch"; then
+    rm -f "$body" "$batch"
+    err "Candidate nftables không hợp lệ. Giữ nguyên firewall cũ."
     return 1
   fi
 
-  if ! ipset swap "$SET6_NEW" "$SET6"; then
-    warn "[!] IPv6 swap thất bại. Đang rollback IPv4..."
-    if ! ipset swap "$SET4_NEW" "$SET4"; then
-      err "ROLLBACK IPv4 thất bại. Cần kiểm tra firewall ngay."
-      # Giữ các set tạm để có dữ liệu phục hồi thủ công, không destroy.
-      return 1
-    fi
-    ipset destroy "$SET4_NEW" 2>/dev/null || true
-    ipset destroy "$SET6_NEW" 2>/dev/null || true
-    err "Không swap được IPv6 IPSet. IPv4 đã rollback về dữ liệu cũ."
+  # One nft batch is one netlink transaction: either the private table is replaced
+  # successfully or the old live ruleset remains in place.
+  if ! nft -f "$batch"; then
+    rm -f "$body" "$batch"
+    err "Không apply được transaction nftables. Giữ nguyên firewall cũ."
     return 1
   fi
 
-  ipset destroy "$SET4_NEW"
-  ipset destroy "$SET6_NEW"
+  if ! install -m 600 "$body" "$CONF_DIR/nftables.conf"; then
+    rm -f "$body" "$batch"
+    err "Live firewall đã apply nhưng không lưu được file persistence."
+    return 1
+  fi
 
-  rm -f "$PREFIX4_FILE" "$PREFIX6_FILE"
+  rm -f "$body" "$batch" "$PREFIX4_FILE" "$PREFIX6_FILE"
 }
 
-ensure_jump_once() {
-  local fw="$1" parent="$2" child="$3"
-
-  while "$fw" -C "$parent" -j "$child" >/dev/null 2>&1; do
-    "$fw" -D "$parent" -j "$child"
-  done
-
-  "$fw" -I "$parent" 1 -j "$child"
-}
-
-apply_family_rules() {
-  local fw="$1" setname="$2"
-
-  "$fw" -N "$CHAIN_IN" 2>/dev/null || true
-  "$fw" -F "$CHAIN_IN"
-  "$fw" -A "$CHAIN_IN" -m set --match-set "$setname" src -j DROP
-
-  "$fw" -N "$CHAIN_OUT" 2>/dev/null || true
-  "$fw" -F "$CHAIN_OUT"
-  "$fw" -A "$CHAIN_OUT" -m set --match-set "$setname" dst -j DROP
-
-  "$fw" -N "$CHAIN_FWD" 2>/dev/null || true
-  "$fw" -F "$CHAIN_FWD"
-  "$fw" -A "$CHAIN_FWD" -m set --match-set "$setname" src -j DROP
-  "$fw" -A "$CHAIN_FWD" -m set --match-set "$setname" dst -j DROP
-
-  ensure_jump_once "$fw" INPUT   "$CHAIN_IN"
-  ensure_jump_once "$fw" OUTPUT  "$CHAIN_OUT"
-  ensure_jump_once "$fw" FORWARD "$CHAIN_FWD"
-}
-
-cleanup_legacy_ipv4() {
-  # Các chain đời cũ trước CNCFW_*.
-  while iptables -C INPUT -j CN_CARRIER_BLOCK >/dev/null 2>&1; do
-    iptables -D INPUT -j CN_CARRIER_BLOCK || true
-  done
-  while iptables -C OUTPUT -j CN_CARRIER_BLOCK_OUT >/dev/null 2>&1; do
-    iptables -D OUTPUT -j CN_CARRIER_BLOCK_OUT || true
-  done
-
-  iptables -F CN_CARRIER_BLOCK 2>/dev/null || true
-  iptables -X CN_CARRIER_BLOCK 2>/dev/null || true
-  iptables -F CN_CARRIER_BLOCK_OUT 2>/dev/null || true
-  iptables -X CN_CARRIER_BLOCK_OUT 2>/dev/null || true
-}
-
-apply_firewall() {
-  apply_family_rules iptables  "$SET4"
-  apply_family_rules ip6tables "$SET6"
-
-  cleanup_legacy_ipv4
-
-  # Set IPv4 tên cũ của V2.x không còn được chain nào tham chiếu sau khi
-  # CNCFW_* đã được flush và tạo lại.
-  ipset destroy cncfw_block 2>/dev/null || true
-  ipset destroy cn_ut_block 2>/dev/null || true
-}
-
-verify_family() {
-  local fw="$1" setname="$2" label="$3"
-
-  ipset list "$setname" >/dev/null 2>&1 || {
-    err "Thiếu IPSet $label: $setname"
-    return 1
-  }
-
-  "$fw" -C INPUT -j "$CHAIN_IN" >/dev/null 2>&1 || {
-    err "$label thiếu jump INPUT -> $CHAIN_IN"
-    return 1
-  }
-  "$fw" -C OUTPUT -j "$CHAIN_OUT" >/dev/null 2>&1 || {
-    err "$label thiếu jump OUTPUT -> $CHAIN_OUT"
-    return 1
-  }
-  "$fw" -C FORWARD -j "$CHAIN_FWD" >/dev/null 2>&1 || {
-    err "$label thiếu jump FORWARD -> $CHAIN_FWD"
-    return 1
-  }
-
-  "$fw" -C "$CHAIN_IN" -m set --match-set "$setname" src -j DROP >/dev/null 2>&1 || {
-    err "$label thiếu DROP nguồn trong $CHAIN_IN"
-    return 1
-  }
-  "$fw" -C "$CHAIN_OUT" -m set --match-set "$setname" dst -j DROP >/dev/null 2>&1 || {
-    err "$label thiếu DROP đích trong $CHAIN_OUT"
-    return 1
-  }
-  "$fw" -C "$CHAIN_FWD" -m set --match-set "$setname" src -j DROP >/dev/null 2>&1 || {
-    err "$label thiếu DROP nguồn trong $CHAIN_FWD"
-    return 1
-  }
-  "$fw" -C "$CHAIN_FWD" -m set --match-set "$setname" dst -j DROP >/dev/null 2>&1 || {
-    err "$label thiếu DROP đích trong $CHAIN_FWD"
-    return 1
-  }
-}
+apply_firewall() { :; }
 
 verify_firewall() {
-  verify_family iptables  "$SET4" "IPv4"
-  verify_family ip6tables "$SET6" "IPv6"
+  local in_dump out_dump fwd_dump
+  nft list table inet cncfw >/dev/null 2>&1 || { err "Thiếu table inet cncfw"; return 1; }
+  nft list set inet cncfw block4 >/dev/null 2>&1 || { err "Thiếu IPv4 set block4"; return 1; }
+  nft list set inet cncfw block6 >/dev/null 2>&1 || { err "Thiếu IPv6 set block6"; return 1; }
+
+  in_dump="$(nft list chain inet cncfw input 2>/dev/null)" || { err "Thiếu chain input"; return 1; }
+  out_dump="$(nft list chain inet cncfw output 2>/dev/null)" || { err "Thiếu chain output"; return 1; }
+  fwd_dump="$(nft list chain inet cncfw forward 2>/dev/null)" || { err "Thiếu chain forward"; return 1; }
+
+  grep -q 'hook input' <<<"$in_dump" || { err "Chain input không gắn hook input"; return 1; }
+  grep -q 'ip saddr @block4.*drop' <<<"$in_dump" || { err "Thiếu IPv4 rule trong INPUT"; return 1; }
+  grep -q 'ip6 saddr @block6.*drop' <<<"$in_dump" || { err "Thiếu IPv6 rule trong INPUT"; return 1; }
+
+  grep -q 'hook output' <<<"$out_dump" || { err "Chain output không gắn hook output"; return 1; }
+  grep -q 'ip daddr @block4.*drop' <<<"$out_dump" || { err "Thiếu IPv4 rule trong OUTPUT"; return 1; }
+  grep -q 'ip6 daddr @block6.*drop' <<<"$out_dump" || { err "Thiếu IPv6 rule trong OUTPUT"; return 1; }
+
+  grep -q 'hook forward' <<<"$fwd_dump" || { err "Chain forward không gắn hook forward"; return 1; }
+  grep -q 'ip saddr @block4.*drop' <<<"$fwd_dump" || { err "Thiếu IPv4 source rule trong FORWARD"; return 1; }
+  grep -q 'ip daddr @block4.*drop' <<<"$fwd_dump" || { err "Thiếu IPv4 destination rule trong FORWARD"; return 1; }
+  grep -q 'ip6 saddr @block6.*drop' <<<"$fwd_dump" || { err "Thiếu IPv6 source rule trong FORWARD"; return 1; }
+  grep -q 'ip6 daddr @block6.*drop' <<<"$fwd_dump" || { err "Thiếu IPv6 destination rule trong FORWARD"; return 1; }
+
+  # Require both sets to contain elements; prevents a false-success empty firewall.
+  nft list set inet cncfw block4 2>/dev/null | grep -q 'elements = {' || { err "IPv4 set rỗng"; return 1; }
+  nft list set inet cncfw block6 2>/dev/null | grep -q 'elements = {' || { err "IPv6 set rỗng"; return 1; }
 }
 
-save_ipsets() {
-  local tmp
-  tmp="$(mktemp "${CONF_DIR}/ipset.rules.tmp.XXXXXX")" || {
-    err "Không tạo được file tạm để lưu IPSet."
-    return 1
-  }
+cleanup_legacy_cncfw() {
+  # Best-effort migration cleanup only. Never switch iptables backend and never
+  # flush global firewall tables. If an old xtables chain is incompatible, leave
+  # it untouched rather than risking unrelated VPS rules.
+  local fw
+  for fw in iptables ip6tables; do
+    command -v "$fw" >/dev/null 2>&1 || continue
+    if "$fw" -S >/dev/null 2>&1; then
+      remove_chain_family "$fw" || true
+    fi
+  done
 
-  if ! ipset save "$SET4" >"$tmp" || ! ipset save "$SET6" >>"$tmp"; then
-    rm -f "$tmp"
-    err "Không lưu được IPSet persistent."
-    return 1
+  if command -v ipset >/dev/null 2>&1; then
+    for oldset in cncfw_block4 cncfw_block4_new cncfw_block6 cncfw_block6_new cncfw_block cn_ut_block; do
+      ipset destroy "$oldset" >/dev/null 2>&1 || true
+    done
   fi
-
-  if [[ ! -s "$tmp" ]]; then
-    rm -f "$tmp"
-    err "File IPSet persistent bị rỗng."
-    return 1
-  fi
-
-  chmod 600 "$tmp"
-  mv -f "$tmp" "$IPSET_SAVE"
 }
+
 
 save_persistence() {
-  local ipset_bin
+  local nft_bin
   mkdir -p "$CONF_DIR"
-  save_ipsets
+  [[ -s "$CONF_DIR/nftables.conf" ]] || { err "Thiếu nftables.conf"; return 1; }
+  nft_bin="$(command -v nft)" || { err "Không tìm thấy nft"; return 1; }
+  [[ -x "$nft_bin" ]] || { err "nft không executable: $nft_bin"; return 1; }
 
-  ipset_bin="$(command -v ipset)" || {
-    err "Không tìm thấy binary ipset."
-    return 1
-  }
+  # Restore helper builds ONE nft transaction. If cncfw already exists, deletion
+  # and recreation happen in the same netlink batch, so restarting the service
+  # does not create a delete->load gap.
+  cat >"$CONF_DIR/restore-nft.sh" <<EOF
+#!/usr/bin/env bash
+set -Eeuo pipefail
+NFT_BIN="$nft_bin"
+CONF_FILE="$CONF_DIR/nftables.conf"
+TMP=\$(mktemp /run/cncfw-restore.XXXXXX)
+trap 'rm -f "\$TMP"' EXIT
+[[ -s "\$CONF_FILE" ]] || exit 1
+if "\$NFT_BIN" list table inet cncfw >/dev/null 2>&1; then
+  { echo 'delete table inet cncfw'; cat "\$CONF_FILE"; } >"\$TMP"
+else
+  cat "\$CONF_FILE" >"\$TMP"
+fi
+"\$NFT_BIN" -c -f "\$TMP"
+"\$NFT_BIN" -f "\$TMP"
+"\$NFT_BIN" list table inet cncfw >/dev/null
+EOF
+  chmod 700 "$CONF_DIR/restore-nft.sh"
 
   cat >"/etc/systemd/system/$RESTORE_SERVICE" <<EOF
 [Unit]
-Description=Restore China Carrier Firewall IPv4/IPv6 ipsets
+Description=Restore China Carrier Firewall nftables table atomically
 DefaultDependencies=no
 After=local-fs.target
-Before=netfilter-persistent.service
-ConditionPathIsReadable=$IPSET_SAVE
+Before=network-pre.target
 
 [Service]
 Type=oneshot
-ExecStart=/bin/sh -ec '$ipset_bin restore -exist < "$IPSET_SAVE"'
+ExecStart=$CONF_DIR/restore-nft.sh
 RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
 EOF
-
-  mkdir -p /etc/systemd/system/netfilter-persistent.service.d
-
-  cat >/etc/systemd/system/netfilter-persistent.service.d/cn-carrier-fw.conf <<EOF
-[Unit]
-Requires=$RESTORE_SERVICE
-After=$RESTORE_SERVICE
-EOF
-
   cat >"/etc/systemd/system/$UPDATE_SERVICE" <<EOF
 [Unit]
-Description=Update China Carrier Firewall IPv4/IPv6 prefixes
+Description=Update China Carrier Firewall prefixes
 After=network-online.target
 Wants=network-online.target
-
 [Service]
 Type=oneshot
-# Keep daily database refresh out of the dataplane on small 1C/1GB VPS.
-# These affect only the update process, not packet forwarding.
 Nice=19
 IOSchedulingClass=idle
 CPUWeight=10
 ExecStart=$INSTALL_PATH --apply-saved
 TimeoutStartSec=30min
 EOF
-
   cat >"/etc/systemd/system/$UPDATE_TIMER" <<'EOF'
 [Unit]
 Description=Daily China Carrier Firewall prefix update
-
 [Timer]
 OnBootSec=15min
 OnUnitActiveSec=24h
 RandomizedDelaySec=15min
 Persistent=true
-
 [Install]
 WantedBy=timers.target
 EOF
-
   systemctl daemon-reload
   systemctl enable "$RESTORE_SERVICE" >/dev/null
   systemctl enable "$UPDATE_TIMER" >/dev/null
-  systemctl enable netfilter-persistent.service >/dev/null 2>&1 || {
-    err "Không enable được netfilter-persistent.service"
-    return 1
-  }
-
-  # Chỉ kích hoạt timer sau khi firewall đã được lưu persistent thành công.
-  # Tránh trạng thái cài đặt dở dang nhưng timer vẫn chạy.
-  netfilter-persistent save >/dev/null
-
-  [[ -s /etc/iptables/rules.v4 ]] || {
-    err "Không thấy /etc/iptables/rules.v4 sau khi save."
-    return 1
-  }
-
-  [[ -s /etc/iptables/rules.v6 ]] || {
-    err "Không thấy /etc/iptables/rules.v6 sau khi save."
-    return 1
-  }
-
-  systemctl is-enabled --quiet "$RESTORE_SERVICE" || {
-    err "$RESTORE_SERVICE chưa được enable."
-    return 1
-  }
-  systemctl is-enabled --quiet "$UPDATE_TIMER" || {
-    err "$UPDATE_TIMER chưa được enable."
-    return 1
-  }
-  systemctl is-enabled --quiet netfilter-persistent.service || {
-    err "netfilter-persistent.service chưa được enable."
-    return 1
-  }
-
+  systemctl is-enabled --quiet "$RESTORE_SERVICE" || { err "Không enable được restore service"; return 1; }
+  systemctl is-enabled --quiet "$UPDATE_TIMER" || { err "Không enable được update timer"; return 1; }
   systemctl is-active --quiet "$UPDATE_TIMER" || systemctl start "$UPDATE_TIMER"
+  systemctl is-active --quiet "$UPDATE_TIMER" || { err "Update timer không chạy"; return 1; }
 }
 
 apply_choice() {
   local choice="$1"
+  local staged_choice old_live old_persist old_config had_live=0 had_persist=0 had_config=0
+  local systemd_backup restore_helper_backup
+  local restore_enabled restore_active update_enabled update_active timer_enabled timer_active
 
   rm -f "$PREFIX4_FILE" "$PREFIX6_FILE"
+  mkdir -p "$CONF_DIR"
 
-  fetch_prefixes "$choice"
-  preflight_firewall
-  update_ipsets_atomic
-  apply_firewall
-  verify_firewall
-  # Persist the already-verified live firewall first. Commit CHOICE only after
-  # persistence succeeds, so a failed save cannot advertise a new selection.
-  save_persistence
-  save_choice "$choice" || {
-    err "Firewall đã lưu nhưng không ghi được cấu hình CHOICE."
+  # Prepare the config commit BEFORE touching the live firewall. The final mv is
+  # same-filesystem and atomic; this avoids late disk/allocation work after apply.
+  staged_choice="$(mktemp "${CONF_DIR}/config.stage.XXXXXX")" || return 1
+  printf 'CHOICE="%s"\n' "$choice" >"$staged_choice" || { rm -f "$staged_choice"; return 1; }
+  chmod 600 "$staged_choice" || { rm -f "$staged_choice"; return 1; }
+
+  # Snapshots are used only if a post-apply commit step fails.
+  old_live="$(mktemp "${CONF_DIR}/nft.oldlive.XXXXXX")" || { rm -f "$staged_choice"; return 1; }
+  old_persist="$(mktemp "${CONF_DIR}/nft.oldpersist.XXXXXX")" || { rm -f "$staged_choice" "$old_live"; return 1; }
+  old_config="$(mktemp "${CONF_DIR}/config.old.XXXXXX")" || { rm -f "$staged_choice" "$old_live" "$old_persist"; return 1; }
+
+  if nft list table inet cncfw >"$old_live" 2>/dev/null; then had_live=1; else : >"$old_live"; fi
+  if [[ -s "$CONF_DIR/nftables.conf" ]]; then cp -f "$CONF_DIR/nftables.conf" "$old_persist"; had_persist=1; else : >"$old_persist"; fi
+  if [[ -f "$CONF_FILE" ]]; then cp -f "$CONF_FILE" "$old_config"; had_config=1; else : >"$old_config"; fi
+
+  # Snapshot persistence helpers + systemd unit files and their runtime states.
+  # save_persistence() mutates these after the live firewall is already applied,
+  # so a later failure must be able to restore them too.
+  systemd_backup="$(mktemp -d "${CONF_DIR}/systemd.old.XXXXXX")" || {
+    rm -f "$staged_choice" "$old_live" "$old_persist" "$old_config"
+    [[ -n "${systemd_backup:-}" ]] && rm -rf "$systemd_backup" || true
     return 1
   }
+  restore_helper_backup="$systemd_backup/restore-nft.sh"
+  for unit in "$RESTORE_SERVICE" "$UPDATE_SERVICE" "$UPDATE_TIMER"; do
+    if [[ -f "/etc/systemd/system/$unit" ]]; then
+      cp -a "/etc/systemd/system/$unit" "$systemd_backup/$unit"
+      : >"$systemd_backup/$unit.existed"
+    fi
+  done
+  if [[ -f "$CONF_DIR/restore-nft.sh" ]]; then
+    cp -a "$CONF_DIR/restore-nft.sh" "$restore_helper_backup"
+    : >"$systemd_backup/restore-helper.existed"
+  fi
+
+  restore_enabled="$(systemctl is-enabled "$RESTORE_SERVICE" 2>/dev/null || true)"
+  restore_active="$(systemctl is-active "$RESTORE_SERVICE" 2>/dev/null || true)"
+  update_enabled="$(systemctl is-enabled "$UPDATE_SERVICE" 2>/dev/null || true)"
+  update_active="$(systemctl is-active "$UPDATE_SERVICE" 2>/dev/null || true)"
+  timer_enabled="$(systemctl is-enabled "$UPDATE_TIMER" 2>/dev/null || true)"
+  timer_active="$(systemctl is-active "$UPDATE_TIMER" 2>/dev/null || true)"
+
+  rollback_apply() {
+    local rb
+    warn "[!] Commit chưa hoàn tất; đang rollback firewall/cấu hình cũ..."
+    rb="$(mktemp "${CONF_DIR}/nft.rollback.XXXXXX")" || return 1
+    if nft list table inet cncfw >/dev/null 2>&1; then echo 'delete table inet cncfw' >"$rb"; fi
+    if (( had_live )); then cat "$old_live" >>"$rb"; fi
+    if [[ -s "$rb" ]]; then nft -c -f "$rb" >/dev/null 2>&1 && nft -f "$rb" >/dev/null 2>&1 || warn "[!] Rollback live nftables thất bại; cần kiểm tra thủ công."; fi
+    rm -f "$rb"
+    if (( had_persist )); then install -m 600 "$old_persist" "$CONF_DIR/nftables.conf" || true; else rm -f "$CONF_DIR/nftables.conf"; fi
+    if (( had_config )); then install -m 600 "$old_config" "$CONF_FILE" || true; else rm -f "$CONF_FILE"; fi
+
+    # Restore helper/unit files exactly to their pre-apply presence/content.
+    if [[ -f "$systemd_backup/restore-helper.existed" ]]; then
+      cp -a "$restore_helper_backup" "$CONF_DIR/restore-nft.sh" 2>/dev/null || true
+    else
+      rm -f "$CONF_DIR/restore-nft.sh"
+    fi
+    for unit in "$RESTORE_SERVICE" "$UPDATE_SERVICE" "$UPDATE_TIMER"; do
+      if [[ -f "$systemd_backup/$unit.existed" ]]; then
+        cp -a "$systemd_backup/$unit" "/etc/systemd/system/$unit" 2>/dev/null || true
+      else
+        rm -f "/etc/systemd/system/$unit"
+      fi
+    done
+    systemctl daemon-reload >/dev/null 2>&1 || true
+
+    # Restore enablement. 'static'/'indirect' are not changed; only states that
+    # were explicitly enabled/disabled before this transaction are replayed.
+    case "$restore_enabled" in enabled) systemctl enable "$RESTORE_SERVICE" >/dev/null 2>&1 || true ;; disabled) systemctl disable "$RESTORE_SERVICE" >/dev/null 2>&1 || true ;; esac
+    case "$update_enabled"  in enabled) systemctl enable "$UPDATE_SERVICE"  >/dev/null 2>&1 || true ;; disabled) systemctl disable "$UPDATE_SERVICE"  >/dev/null 2>&1 || true ;; esac
+    case "$timer_enabled"   in enabled) systemctl enable "$UPDATE_TIMER"    >/dev/null 2>&1 || true ;; disabled) systemctl disable "$UPDATE_TIMER"    >/dev/null 2>&1 || true ;; esac
+
+    # Restore active state without leaving a newly-created timer/service running.
+    case "$timer_active" in active) systemctl start "$UPDATE_TIMER" >/dev/null 2>&1 || true ;; *) systemctl stop "$UPDATE_TIMER" >/dev/null 2>&1 || true ;; esac
+    case "$restore_active" in active) systemctl start "$RESTORE_SERVICE" >/dev/null 2>&1 || true ;; *) systemctl stop "$RESTORE_SERVICE" >/dev/null 2>&1 || true ;; esac
+    # UPDATE_SERVICE is oneshot and normally inactive; do not re-run a previous
+    # update job during rollback. If it was not active, make sure it stays stopped.
+    [[ "$update_active" == "active" ]] || systemctl stop "$UPDATE_SERVICE" >/dev/null 2>&1 || true
+  }
+
+  if ! fetch_prefixes "$choice" || ! preflight_firewall; then
+    rm -f "$staged_choice" "$old_live" "$old_persist" "$old_config"
+    [[ -n "${systemd_backup:-}" ]] && rm -rf "$systemd_backup" || true
+    return 1
+  fi
+
+  # update_ipsets_atomic can already have changed the live table before a later
+  # local persistence write fails, so any failure from this point must rollback.
+  if ! update_ipsets_atomic; then
+    rollback_apply
+    rm -f "$staged_choice" "$old_live" "$old_persist" "$old_config"
+    [[ -n "${systemd_backup:-}" ]] && rm -rf "$systemd_backup" || true
+    return 1
+  fi
+  if ! verify_firewall; then
+    rollback_apply
+    rm -f "$staged_choice" "$old_live" "$old_persist" "$old_config"
+    [[ -n "${systemd_backup:-}" ]] && rm -rf "$systemd_backup" || true
+    return 1
+  fi
+
+  if ! save_persistence; then
+    rollback_apply
+    rm -f "$staged_choice" "$old_live" "$old_persist" "$old_config"
+    [[ -n "${systemd_backup:-}" ]] && rm -rf "$systemd_backup" || true
+    return 1
+  fi
+
+  # Final config commit. If even this atomic rename fails, restore the old state.
+  if ! mv -f "$staged_choice" "$CONF_FILE"; then
+    err "Không commit được CHOICE; rollback để tránh lệch trạng thái."
+    rollback_apply
+    rm -f "$staged_choice" "$old_live" "$old_persist" "$old_config"
+    [[ -n "${systemd_backup:-}" ]] && rm -rf "$systemd_backup" || true
+    return 1
+  fi
+
+  cleanup_legacy_cncfw
+  rm -f "$old_live" "$old_persist" "$old_config"
+  rm -rf "$systemd_backup"
 
   echo
   log "=================================================="
@@ -864,62 +855,26 @@ self_update() {
 
 remove_all() {
   log "[+] Gỡ China Carrier Firewall IPv4 + IPv6..."
-
-  remove_chain_family iptables
-  remove_chain_family ip6tables
-  cleanup_legacy_ipv4
-
-  ipset destroy "$SET4_NEW" 2>/dev/null || true
-  ipset destroy "$SET6_NEW" 2>/dev/null || true
-  ipset destroy "$SET4" 2>/dev/null || true
-  ipset destroy "$SET6" 2>/dev/null || true
-
-  # Tên set các phiên bản cũ.
-  ipset destroy cncfw_block 2>/dev/null || true
-  ipset destroy cn_ut_block 2>/dev/null || true
-
+  nft delete table inet cncfw 2>/dev/null || true
+  cleanup_legacy_cncfw || true
   systemctl disable --now "$UPDATE_TIMER" >/dev/null 2>&1 || true
   systemctl disable --now "$RESTORE_SERVICE" >/dev/null 2>&1 || true
-
-  rm -f \
-    "/etc/systemd/system/$RESTORE_SERVICE" \
-    "/etc/systemd/system/$UPDATE_SERVICE" \
-    "/etc/systemd/system/$UPDATE_TIMER" \
-    "/etc/systemd/system/netfilter-persistent.service.d/cn-carrier-fw.conf" \
-    "$CONF_FILE" "$IPSET_SAVE" \
-    "$PREFIX4_FILE" "$PREFIX6_FILE"
-
+  rm -f "/etc/systemd/system/$RESTORE_SERVICE" "/etc/systemd/system/$UPDATE_SERVICE" "/etc/systemd/system/$UPDATE_TIMER" \
+    "$CONF_FILE" "$CONF_DIR/nftables.conf" "$PREFIX4_FILE" "$PREFIX6_FILE"
   rm -rf "$CACHE_DIR"
-
   systemctl daemon-reload
-  netfilter-persistent save >/dev/null 2>&1 || true
-
-  log "[+] Đã gỡ toàn bộ IPv4 + IPv6 rule do script tạo."
+  log "[+] Đã gỡ toàn bộ rule do script tạo."
 }
 
 show_set_status() {
   local setname="$1" label="$2"
-
-  echo "--- $label IPSet ---"
-  if ipset list "$setname" >/dev/null 2>&1; then
-    ipset list "$setname" | grep -E '^(Name:|Type:|Header:|Size in memory:|Number of entries:)'
-  else
-    echo "$setname: chưa tồn tại"
-  fi
+  echo "--- $label nft set ---"
+  nft list set inet cncfw "$setname" 2>/dev/null | grep -E 'elements =|counter' || echo "$setname: chưa tồn tại"
 }
-
 show_family_rules() {
-  local fw="$1" label="$2"
-
   echo
-  echo "--- $label INPUT ---"
-  "$fw" -L "$CHAIN_IN" -n -v 2>/dev/null || true
-  echo
-  echo "--- $label OUTPUT ---"
-  "$fw" -L "$CHAIN_OUT" -n -v 2>/dev/null || true
-  echo
-  echo "--- $label FORWARD ---"
-  "$fw" -L "$CHAIN_FWD" -n -v 2>/dev/null || true
+  echo "--- nftables cncfw ---"
+  nft list table inet cncfw 2>/dev/null || true
 }
 
 
@@ -963,10 +918,42 @@ PY
   fi
 
   echo "IP: $ip ($family)"
-  if ipset test "$setname" "$ip" >/dev/null 2>&1; then
-    echo "IPSet: BLOCKED ($setname)"
+  # For interval/CIDR sets, verify membership against the live nft set dump.
+  # This is a manual diagnostic path only; it is NOT used on packet processing.
+  if command -v python3 >/dev/null 2>&1 && nft list set inet cncfw "$setname" >/dev/null 2>&1; then
+    if nft list set inet cncfw "$setname" 2>/dev/null | python3 -c '
+import ipaddress, re, sys
+ip = ipaddress.ip_address(sys.argv[1])
+text = sys.stdin.read()
+m = re.search(r"elements\s*=\s*\{(.*?)\}", text, re.S)
+if not m:
+    raise SystemExit(1)
+for raw in m.group(1).split(","):
+    token = raw.strip().split()[0] if raw.strip() else ""
+    if not token:
+        continue
+    try:
+        if "-" in token:
+            a, b = map(str.strip, token.split("-", 1))
+            if ipaddress.ip_address(a) <= ip <= ipaddress.ip_address(b):
+                raise SystemExit(0)
+        elif ip in ipaddress.ip_network(token, strict=False):
+            raise SystemExit(0)
+    except ValueError:
+        pass
+raise SystemExit(1)
+' "$ip"; then
+      echo "nft set: BLOCKED ($setname)"
+    else
+      echo "nft set: NOT BLOCKED ($setname)"
+    fi
   else
-    echo "IPSet: NOT BLOCKED ($setname)"
+    # Fallback for minimal systems. nft itself performs the live set lookup.
+    if nft get element inet cncfw "$setname" "{ $ip }" >/dev/null 2>&1; then
+      echo "nft set: BLOCKED ($setname)"
+    else
+      echo "nft set: NOT BLOCKED ($setname)"
+    fi
   fi
 
   echo "RIPEstat origin:"
@@ -993,20 +980,20 @@ show_status() {
   echo "=================================================="
 
   if [[ -f "$CONF_FILE" ]]; then
-    # shellcheck disable=SC1090
-    source "$CONF_FILE"
-    echo "Cấu hình: $(choice_description "${CHOICE:-0}")"
+    local saved_line saved_choice
+    saved_line="$(grep -E '^CHOICE="?([1-6])"?$' "$CONF_FILE" | tail -n1 || true)"
+    saved_choice="${saved_line#CHOICE=}"; saved_choice="${saved_choice%\"}"; saved_choice="${saved_choice#\"}"
+    echo "Cấu hình: $(choice_description "${saved_choice:-0}")"
   else
     echo "Cấu hình: chưa lưu"
   fi
 
   echo
-  show_set_status "$SET4" "IPv4"
+  show_set_status "block4" "IPv4"
   echo
-  show_set_status "$SET6" "IPv6"
+  show_set_status "block6" "IPv6"
 
-  show_family_rules iptables "IPv4"
-  show_family_rules ip6tables "IPv6"
+  show_family_rules
 
   echo
   echo "--- TIMER ---"

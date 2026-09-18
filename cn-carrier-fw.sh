@@ -13,7 +13,7 @@
 set -Eeuo pipefail
 
 APP="cn-carrier-fw"
-VERSION="3.5.4-nft-systemd-rollback-safe"
+VERSION="3.5.5-nft-verify-fix"
 INSTALL_PATH="/usr/local/sbin/cn-carrier-fw"
 
 CONF_DIR="/etc/cn-carrier-fw"
@@ -445,7 +445,7 @@ update_ipsets_atomic() {
 apply_firewall() { :; }
 
 verify_firewall() {
-  local in_dump out_dump fwd_dump
+  local in_dump out_dump fwd_dump set4_dump set6_dump
   nft list table inet cncfw >/dev/null 2>&1 || { err "Thiếu table inet cncfw"; return 1; }
   nft list set inet cncfw block4 >/dev/null 2>&1 || { err "Thiếu IPv4 set block4"; return 1; }
   nft list set inet cncfw block6 >/dev/null 2>&1 || { err "Thiếu IPv6 set block6"; return 1; }
@@ -468,9 +468,14 @@ verify_firewall() {
   grep -q 'ip6 saddr @block6.*drop' <<<"$fwd_dump" || { err "Thiếu IPv6 source rule trong FORWARD"; return 1; }
   grep -q 'ip6 daddr @block6.*drop' <<<"$fwd_dump" || { err "Thiếu IPv6 destination rule trong FORWARD"; return 1; }
 
-  # Require both sets to contain elements; prevents a false-success empty firewall.
-  nft list set inet cncfw block4 2>/dev/null | grep -q 'elements = {' || { err "IPv4 set rỗng"; return 1; }
-  nft list set inet cncfw block6 2>/dev/null | grep -q 'elements = {' || { err "IPv6 set rỗng"; return 1; }
+  # Capture the complete set output before grep. With set -o pipefail, using
+  # `nft ... | grep -q` on a large set can make nft receive SIGPIPE after grep
+  # finds the first match, falsely making the pipeline fail and reporting an
+  # actually populated set as empty.
+  set4_dump="$(nft list set inet cncfw block4 2>/dev/null)" || { err "Không đọc được IPv4 set block4"; return 1; }
+  set6_dump="$(nft list set inet cncfw block6 2>/dev/null)" || { err "Không đọc được IPv6 set block6"; return 1; }
+  grep -q 'elements = {' <<<"$set4_dump" || { err "IPv4 set rỗng"; return 1; }
+  grep -q 'elements = {' <<<"$set6_dump" || { err "IPv6 set rỗng"; return 1; }
 }
 
 cleanup_legacy_cncfw() {

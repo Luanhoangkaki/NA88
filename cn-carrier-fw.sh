@@ -12,7 +12,7 @@
 set -Eeuo pipefail
 
 APP="cn-carrier-fw"
-VERSION="3.3.11-cache-commit-safe"
+VERSION="3.4.1-lowram-safe"
 INSTALL_PATH="/usr/local/sbin/cn-carrier-fw"
 
 CONF_DIR="/etc/cn-carrier-fw"
@@ -69,17 +69,23 @@ TELECOM_ASNS=(
   140484 140494 140527 140553 140638
   141006 141679 141739 141771 146966 147038 151185 151823
   58461 136190
+  # APNIC-verified China Telecom networks missing from previous DB
+  4815 17638 23650 137689 140636
 )
 
 UNICOM_ASNS=(
   4837 9929 10099 4808 17621 17622 17623 17816
   134543 135061 136958 140720 140886
+  # Conservative expansion: China Unicom-owned/provincial networks verified via APNIC data
+  133118 133119 134542 136959 137539 138421 140726 140979 152120
 )
 
 MOBILE_ASNS=(
   9808
   56040 56041 56042 56044 56046 56047 56048
   24400 24444
+  # APNIC-verified China Mobile provincial/access networks missing from previous DB
+  24547 24445 38019 56045 132525 134810 141425
 )
 
 log()  { printf '\033[1;32m%s\033[0m\n' "$*"; }
@@ -138,11 +144,15 @@ install_self() {
 }
 
 save_choice() {
-  local choice="$1"
-  cat >"$CONF_FILE" <<EOF
-CHOICE="$choice"
-EOF
-  chmod 600 "$CONF_FILE"
+  local choice="$1" tmp
+  mkdir -p "$CONF_DIR"
+  tmp="$(mktemp "${CONF_DIR}/config.tmp.XXXXXX")" || return 1
+  if ! printf 'CHOICE="%s"\n' "$choice" >"$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$CONF_FILE"
 }
 
 load_choice() {
@@ -180,6 +190,22 @@ choice_description() {
   esac
 }
 
+validate_carrier_db() {
+  local asn owner
+  declare -A seen=()
+  for owner in TELECOM UNICOM MOBILE; do
+    local -n arr="${owner}_ASNS"
+    for asn in "${arr[@]}"; do
+      [[ "$asn" =~ ^[0-9]+$ ]] || { err "ASN không hợp lệ trong $owner: $asn"; return 1; }
+      if [[ -n "${seen[$asn]:-}" && "${seen[$asn]}" != "$owner" ]]; then
+        err "ASN $asn bị gán cho cả ${seen[$asn]} và $owner. Dừng để tránh chặn nhầm carrier."
+        return 1
+      fi
+      seen[$asn]="$owner"
+    done
+  done
+}
+
 build_asn_list() {
   local choice="$1"
   SELECTED_ASNS=()
@@ -196,6 +222,9 @@ build_asn_list() {
       exit 1
       ;;
   esac
+
+  validate_carrier_db || return 1
+  mapfile -t SELECTED_ASNS < <(printf '%s\n' "${SELECTED_ASNS[@]}" | sort -n -u)
 }
 
 fetch_prefixes() {
@@ -306,12 +335,12 @@ fetch_prefixes() {
   ipset destroy "$validate4" 2>/dev/null || true
   ipset destroy "$validate6" 2>/dev/null || true
 
-  if ! ipset create "$validate4" hash:net family inet maxelem 1000000; then
+  if ! ipset create "$validate4" hash:net family inet maxelem 262144; then
     rm -rf "$tmpdir"
     err "Không tạo được IPv4 validation IPSet. Giữ nguyên firewall/IPSet cũ."
     return 1
   fi
-  if ! ipset create "$validate6" hash:net family inet6 maxelem 1000000; then
+  if ! ipset create "$validate6" hash:net family inet6 maxelem 262144; then
     ipset destroy "$validate4" 2>/dev/null || true
     rm -rf "$tmpdir"
     err "Không tạo được IPv6 validation IPSet. Giữ nguyên firewall/IPSet cũ."
@@ -357,13 +386,40 @@ preflight_firewall() {
   }
 }
 
+next_pow2() {
+  local n="$1" p=1
+  (( n < 1 )) && n=1
+  while (( p < n )); do p=$((p * 2)); done
+  printf '%s\n' "$p"
+}
+
+ipset_sizing() {
+  # Keep resident hash tables modest on 1C/1GB VPS while leaving headroom.
+  # hashsize is only the initial hash size; maxelem is a safety ceiling.
+  local count="$1" target max
+  target=$(( (count + 3) / 4 ))
+  (( target < 2048 )) && target=2048
+  (( target > 32768 )) && target=32768
+  IPSET_HASHSIZE="$(next_pow2 "$target")"
+
+  max=$(( count * 2 + 1024 ))
+  (( max < 65536 )) && max=65536
+  (( max > 262144 )) && max=262144
+  IPSET_MAXELEM="$(next_pow2 "$max")"
+  (( IPSET_MAXELEM > 262144 )) && IPSET_MAXELEM=262144
+}
+
 update_ipsets_atomic() {
   # Tạo set tạm hoàn chỉnh trước. Firewall cũ vẫn hoạt động trong lúc nạp.
   ipset destroy "$SET4_NEW" 2>/dev/null || true
   ipset destroy "$SET6_NEW" 2>/dev/null || true
 
-  ipset create "$SET4_NEW" hash:net family inet  hashsize 131072 maxelem 1000000
-  ipset create "$SET6_NEW" hash:net family inet6 hashsize 32768  maxelem 1000000
+  local hash4 max4 hash6 max6
+  ipset_sizing "$PREFIX4_COUNT"; hash4="$IPSET_HASHSIZE"; max4="$IPSET_MAXELEM"
+  ipset_sizing "$PREFIX6_COUNT"; hash6="$IPSET_HASHSIZE"; max6="$IPSET_MAXELEM"
+
+  ipset create "$SET4_NEW" hash:net family inet  hashsize "$hash4" maxelem "$max4"
+  ipset create "$SET6_NEW" hash:net family inet6 hashsize "$hash6" maxelem "$max6"
 
   {
     while IFS= read -r net; do
@@ -377,8 +433,8 @@ update_ipsets_atomic() {
     done <"$PREFIX6_FILE"
   } | ipset restore
 
-  ipset create "$SET4" hash:net family inet  hashsize 131072 maxelem 1000000 -exist
-  ipset create "$SET6" hash:net family inet6 hashsize 32768  maxelem 1000000 -exist
+  ipset create "$SET4" hash:net family inet  hashsize "$hash4" maxelem "$max4" -exist
+  ipset create "$SET6" hash:net family inet6 hashsize "$hash6" maxelem "$max6" -exist
 
   # Hai swap không thể là một transaction kernel duy nhất. Nếu IPv6 swap lỗi
   # sau khi IPv4 đã swap, swap IPv4 ngược lại để tránh trạng thái mixed-generation.
@@ -576,6 +632,11 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+# Keep daily database refresh out of the dataplane on small 1C/1GB VPS.
+# These affect only the update process, not packet forwarding.
+Nice=19
+IOSchedulingClass=idle
+CPUWeight=10
 ExecStart=$INSTALL_PATH --apply-saved
 TimeoutStartSec=30min
 EOF
@@ -642,8 +703,13 @@ apply_choice() {
   update_ipsets_atomic
   apply_firewall
   verify_firewall
-  save_choice "$choice"
+  # Persist the already-verified live firewall first. Commit CHOICE only after
+  # persistence succeeds, so a failed save cannot advertise a new selection.
   save_persistence
+  save_choice "$choice" || {
+    err "Firewall đã lưu nhưng không ghi được cấu hình CHOICE."
+    return 1
+  }
 
   echo
   log "=================================================="

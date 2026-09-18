@@ -13,7 +13,7 @@
 set -Eeuo pipefail
 
 APP="cn-carrier-fw"
-VERSION="3.5.6-ssh-preflight-safe"
+VERSION="3.5.8-carrier-only-safe"
 INSTALL_PATH="/usr/local/sbin/cn-carrier-fw"
 
 CONF_DIR="/etc/cn-carrier-fw"
@@ -229,6 +229,41 @@ build_asn_list() {
   mapfile -t SELECTED_ASNS < <(printf '%s\n' "${SELECTED_ASNS[@]}" | sort -n -u)
 }
 
+sanitize_prefix_file() {
+  local family="$1" infile="$2" outfile="$3" asn="$4"
+  command -v python3 >/dev/null 2>&1 || { err "Thiếu python3 để kiểm tra prefix an toàn."; return 1; }
+  python3 - "$family" "$infile" "$outfile" "$asn" <<'PYSAFE'
+import ipaddress, sys
+family, src, dst, asn = sys.argv[1:]
+want = 4 if family == "4" else 6
+seen=set(); rejected=[]
+with open(src, encoding="utf-8", errors="replace") as f:
+    for raw in f:
+        token=raw.strip()
+        if not token:
+            continue
+        try:
+            net=ipaddress.ip_network(token, strict=True)
+        except ValueError:
+            rejected.append((token,"invalid/non-canonical")); continue
+        if net.version != want:
+            rejected.append((token,"wrong-family")); continue
+        if net.prefixlen == 0:
+            rejected.append((token,"default-route")); continue
+        # BGP carrier blocklist must never contain local/special-use space.
+        if (net.is_private or net.is_loopback or net.is_link_local or
+            net.is_multicast or net.is_unspecified or net.is_reserved):
+            rejected.append((token,"special/non-public")); continue
+        seen.add(str(net))
+with open(dst,"w",encoding="utf-8") as o:
+    for x in sorted(seen, key=lambda z:(ipaddress.ip_network(z).network_address,
+                                        ipaddress.ip_network(z).prefixlen)):
+        o.write(x+"\n")
+for token,why in rejected:
+    print(f"[!] AS{asn}: loại prefix không an toàn {token} ({why})", file=sys.stderr)
+PYSAFE
+}
+
 fetch_prefixes() {
   local choice="$1"
   local tmpdir jsonfile asn
@@ -262,8 +297,17 @@ fetch_prefixes() {
       && jq -e '.status == "ok" and (.data.prefixes | type == "array")' \
         "$jsonfile" >/dev/null 2>&1; then
 
-      jq -r '.data.prefixes[]?.prefix' "$jsonfile" | grep -Fv ':' >"$tmp4" || true
-      jq -r '.data.prefixes[]?.prefix' "$jsonfile" | grep -F ':'  >"$tmp6" || true
+      jq -r '.data.prefixes[]?.prefix' "$jsonfile" | grep -Fv ':' >"${tmp4}.raw" || true
+      jq -r '.data.prefixes[]?.prefix' "$jsonfile" | grep -F ':'  >"${tmp6}.raw" || true
+
+      # Strict carrier-only safety gate. Only valid public CIDRs announced by
+      # this selected ASN are allowed into cache/candidate. Default routes,
+      # malformed/non-canonical CIDRs and special/local ranges are discarded.
+      if ! sanitize_prefix_file 4 "${tmp4}.raw" "$tmp4" "$asn" ||          ! sanitize_prefix_file 6 "${tmp6}.raw" "$tmp6" "$asn"; then
+        rm -rf "$tmpdir"
+        err "Không kiểm tra an toàn được prefix AS${asn}. Giữ nguyên firewall cũ."
+        return 1
+      fi
 
       # Cache commit có marker: bỏ marker cũ trước khi thay bất kỳ dữ liệu nào.
       # Nếu tiến trình chết giữa chừng, lần sau sẽ không dùng cache nửa cũ/nửa mới.
@@ -295,8 +339,14 @@ fetch_prefixes() {
     fi
 
     if [[ -f "$cacheok" && -f "$cache4" && -f "$cache6" ]]; then
-      cat "$cache4" >>"$tmpdir/all4"
-      cat "$cache6" >>"$tmpdir/all6"
+      # Re-validate old cache too; never trust cache created by an older version.
+      if ! sanitize_prefix_file 4 "$cache4" "$tmp4" "$asn" ||          ! sanitize_prefix_file 6 "$cache6" "$tmp6" "$asn"; then
+        rm -rf "$tmpdir"
+        err "Cache AS${asn} không qua được kiểm tra an toàn. Giữ nguyên firewall cũ."
+        return 1
+      fi
+      cat "$tmp4" >>"$tmpdir/all4"
+      cat "$tmp6" >>"$tmpdir/all6"
       reused=$((reused + 1))
       echo "CACHE"
       continue
@@ -308,6 +358,14 @@ fetch_prefixes() {
 
   sort -u "$tmpdir/all4" -o "$tmpdir/all4"
   sort -u "$tmpdir/all6" -o "$tmpdir/all6"
+
+  # Final invariant: no default route may ever reach the nft candidate, even if
+  # a future fetch/cache path changes.
+  if grep -Fxq '0.0.0.0/0' "$tmpdir/all4" 2>/dev/null || grep -Fxq '::/0' "$tmpdir/all6" 2>/dev/null; then
+    err "Phát hiện default route nguy hiểm trong candidate. Hủy cập nhật."
+    rm -rf "$tmpdir"
+    return 1
+  fi
 
   PREFIX4_COUNT="$(grep -c . "$tmpdir/all4" || true)"
   PREFIX6_COUNT="$(grep -c . "$tmpdir/all6" || true)"

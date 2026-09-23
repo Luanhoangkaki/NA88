@@ -893,6 +893,7 @@ function v2node_menu() {
     echo -e "  ${YELLOW}i${RESET}) Cài đặt/Cài lại V2Node"
     echo -e "  ${YELLOW}u${RESET}) Cài lại/Cập nhật V2node Pro V 2.0.1"
     echo -e "  ${YELLOW}s${RESET}) Xem trạng thái V2Node"
+    echo -e "  ${YELLOW}r${RESET}) Khởi động lại V2Node"
     echo ""
     echo -e "${BOLD}┌─ Quản lý Node${RESET}"
     echo -e "  ${YELLOW}1${RESET}) Liệt kê tất cả node"
@@ -924,6 +925,12 @@ function v2node_menu() {
         ;;
       s|S)
         show_v2node_status
+        echo ""
+        echo -e "${GREEN}Hoàn tất.${RESET} Bấm Enter để tiếp tục..."
+        read -r
+        ;;
+      r|R)
+        restart_v2node || true
         echo ""
         echo -e "${GREEN}Hoàn tất.${RESET} Bấm Enter để tiếp tục..."
         read -r
@@ -1038,6 +1045,160 @@ restore_backup() {
   fi
 }
 
+# Cài đặt trực tiếp bằng CLI: install --api-host ... --node-id ... --api-key ... [--timeout 15]
+cli_usage() {
+  cat <<'EOF'
+Cách dùng:
+  bash v2node-pro-manager.sh install --api-host 'https://panel.example.com' --node-id '92' --api-key 'KEY'
+
+Node ID hỗ trợ:
+  81
+  81,82,83
+  81-85
+  81-85,90,95-98
+
+Tùy chọn:
+  --timeout N    Timeout của node, mặc định 15
+EOF
+}
+
+cli_install() {
+  local api_host="" api_key="" nodeid_input="" timeout="15"
+  local nodeids temp_config old_config="" had_config=0
+  local txn_dir="" pre_active=0 pre_enabled=0
+
+  shift # bỏ chữ "install"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --api-host)
+        [[ $# -ge 2 ]] || { echo -e "${RED}Thiếu giá trị cho --api-host${RESET}"; return 2; }
+        api_host="$2"; shift 2 ;;
+      --api-key)
+        [[ $# -ge 2 ]] || { echo -e "${RED}Thiếu giá trị cho --api-key${RESET}"; return 2; }
+        api_key="$2"; shift 2 ;;
+      --node-id)
+        [[ $# -ge 2 ]] || { echo -e "${RED}Thiếu giá trị cho --node-id${RESET}"; return 2; }
+        nodeid_input="$2"; shift 2 ;;
+      --timeout)
+        [[ $# -ge 2 ]] || { echo -e "${RED}Thiếu giá trị cho --timeout${RESET}"; return 2; }
+        timeout="$2"; shift 2 ;;
+      -h|--help)
+        cli_usage; return 0 ;;
+      *)
+        echo -e "${RED}Tham số không hỗ trợ: $1${RESET}"
+        cli_usage
+        return 2 ;;
+    esac
+  done
+
+  [[ -n "$api_host" ]] || { echo -e "${RED}Thiếu --api-host${RESET}"; return 2; }
+  [[ -n "$api_key" ]] || { echo -e "${RED}Thiếu --api-key${RESET}"; return 2; }
+  [[ -n "$nodeid_input" ]] || { echo -e "${RED}Thiếu --node-id${RESET}"; return 2; }
+  case "$api_host" in
+    http://*|https://*) ;;
+    *) echo -e "${RED}API Host phải bắt đầu bằng http:// hoặc https://${RESET}"; return 2 ;;
+  esac
+  [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || { echo -e "${RED}--timeout phải là số nguyên dương.${RESET}"; return 2; }
+
+  if ! nodeids="$(parse_range "$nodeid_input")"; then
+    return 2
+  fi
+
+  check_jq
+  mkdir -p "$(dirname "$CONFIG_FILE")" "$BACKUP_DIR"
+
+  # Tạo config mới ở file tạm trước; không đụng config production nếu JSON chưa hợp lệ.
+  temp_config="$(mktemp /tmp/v2node-config.XXXXXX)"
+  jq -n --arg host "$api_host" --arg key "$api_key" --argjson timeout "$timeout" \
+    --arg ids "$nodeids" '
+      {
+        Log: {Level:"none", Output:"", Access:"none"},
+        Nodes: ($ids | split(" ") | map({ApiHost:$host, NodeID:(tonumber), ApiKey:$key, Timeout:$timeout})),
+        PprofPort: 6060
+      }' > "$temp_config"
+  jq -e '.Nodes | type == "array" and length > 0' "$temp_config" >/dev/null
+
+  # Backup config production để rollback nếu cài/update binary hoặc service thất bại.
+  if [[ -f "$CONFIG_FILE" ]]; then
+    had_config=1
+    old_config="${BACKUP_DIR}/config_before_cli_install_$(date +%Y%m%d_%H%M%S).json"
+    cp -a "$CONFIG_FILE" "$old_config"
+    chmod 600 "$old_config"
+    echo -e "${GRAY}→ Backup config: $old_config${RESET}"
+  fi
+
+  install -m 600 "$temp_config" "$CONFIG_FILE"
+  rm -f "$temp_config"
+
+  echo -e "${CYAN}V2node Pro V ${V2NODE_VERSION} - CLI install${RESET}"
+  echo -e "  ApiHost: ${api_host}"
+  echo -e "  ApiKey : $(mask_api_key "$api_key")"
+  echo -e "  NodeID : ${nodeids}"
+  echo -e "  Timeout: ${timeout}"
+
+  # Snapshot production trước khi thay binary/service để có thể rollback toàn bộ
+  # nếu bước kiểm tra cuối cùng thất bại sau khi installer đã trả về thành công.
+  txn_dir="$(mktemp -d /tmp/v2node-pro-txn.XXXXXX)"
+  [[ -f "$V2NODE_BIN" ]] && cp -a "$V2NODE_BIN" "$txn_dir/v2node"
+  [[ -f "$SERVICE_FILE" ]] && cp -a "$SERVICE_FILE" "$txn_dir/v2node.service"
+  [[ -f "$DROPIN_FILE" ]] && cp -a "$DROPIN_FILE" "$txn_dir/dropin.conf"
+  systemctl is-active --quiet v2node 2>/dev/null && pre_active=1 || true
+  systemctl is-enabled --quiet v2node 2>/dev/null && pre_enabled=1 || true
+
+  if ! download_v2node_pro; then
+    echo -e "${RED}Cài đặt thất bại. Đang rollback config...${RESET}"
+    if [[ "$had_config" -eq 1 && -n "$old_config" && -f "$old_config" ]]; then
+      cp -a "$old_config" "$CONFIG_FILE"
+      chmod 600 "$CONFIG_FILE"
+    else
+      rm -f "$CONFIG_FILE"
+    fi
+    systemctl restart v2node >/dev/null 2>&1 || true
+    rm -rf "$txn_dir"
+    return 1
+  fi
+
+  # Kiểm tra cuối cùng: service phải active, config 600 và runtime nhận GOGC=75.
+  if ! systemctl is-active --quiet v2node; then
+    echo -e "${RED}Service không active sau cài đặt. Đang rollback toàn bộ transaction...${RESET}"
+    if [[ "$had_config" -eq 1 && -n "$old_config" && -f "$old_config" ]]; then
+      cp -a "$old_config" "$CONFIG_FILE"
+      chmod 600 "$CONFIG_FILE"
+    else
+      rm -f "$CONFIG_FILE"
+    fi
+    if [[ -f "$txn_dir/v2node" ]]; then cp -a "$txn_dir/v2node" "$V2NODE_BIN"; else rm -f "$V2NODE_BIN"; fi
+    if [[ -f "$txn_dir/v2node.service" ]]; then cp -a "$txn_dir/v2node.service" "$SERVICE_FILE"; else rm -f "$SERVICE_FILE"; fi
+    if [[ -f "$txn_dir/dropin.conf" ]]; then
+      mkdir -p "$DROPIN_DIR"
+      cp -a "$txn_dir/dropin.conf" "$DROPIN_FILE"
+    else
+      rm -f "$DROPIN_FILE"
+    fi
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if [[ "$pre_enabled" -eq 1 ]]; then systemctl enable v2node >/dev/null 2>&1 || true; else systemctl disable v2node >/dev/null 2>&1 || true; fi
+    if [[ "$pre_active" -eq 1 ]]; then systemctl restart v2node >/dev/null 2>&1 || true; else systemctl stop v2node >/dev/null 2>&1 || true; fi
+    rm -rf "$txn_dir"
+    return 1
+  fi
+  chmod 600 "$CONFIG_FILE"
+  local pid runtime_gogc=""
+  pid="$(systemctl show -p MainPID --value v2node 2>/dev/null || true)"
+  if [[ "$pid" =~ ^[1-9][0-9]*$ && -r "/proc/$pid/environ" ]]; then
+    runtime_gogc="$(tr '\0' '\n' < "/proc/$pid/environ" | grep '^GOGC=' || true)"
+  fi
+
+  echo -e "${GREEN}✓ Cài đặt V2node Pro V ${V2NODE_VERSION} hoàn tất${RESET}"
+  echo -e "${GREEN}✓ Service: active${RESET}"
+  echo -e "${GREEN}✓ Config: $CONFIG_FILE (chmod 600)${RESET}"
+  if [[ "$runtime_gogc" == "GOGC=75" ]]; then
+    echo -e "${GREEN}✓ Runtime: GOGC=75${RESET}"
+  else
+    echo -e "${YELLOW}⚠ Chưa xác nhận được GOGC=75 từ runtime; kiểm tra systemctl cat v2node.${RESET}"
+  fi
+  rm -rf "$txn_dir"
+}
+
 # Hàm chính
 main() {
   # Kiểm tra quyền root trước
@@ -1073,6 +1234,17 @@ main() {
 
 # Nếu chạy trực tiếp script này
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-  main
+  check_root
+  if [[ "${1:-}" == "install" ]]; then
+    cli_install "$@"
+  elif [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    cli_usage
+  elif [[ $# -gt 0 ]]; then
+    echo -e "${RED}Lệnh không hỗ trợ: ${1}${RESET}"
+    cli_usage
+    exit 2
+  else
+    main
+  fi
 fi
 
